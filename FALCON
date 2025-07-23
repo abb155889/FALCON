@@ -1,0 +1,1309 @@
+import numpy as np
+import tifffile
+import torch
+from torch.utils.data import DataLoader
+from torchvision import transforms
+import argparse
+import itertools
+import os
+import random
+from tqdm import tqdm
+from sklearn.metrics import roc_auc_score, f1_score, balanced_accuracy_score, precision_recall_curve, classification_report, roc_curve
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+from PIL import Image
+import time
+import pandas as pd
+import json
+import torchvision.models as models
+import torch.nn as nn
+from torchvision.datasets import ImageFolder
+import cv2
+from torch.autograd import grad
+import random
+from scipy import ndimage
+import matplotlib.pyplot as plt
+import csv
+
+
+def get_argparse():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-d', '--dataset', default='mvtec_ad',
+                        choices=['mvtec_ad', 'mvtec_loco', 'casting', 'mpdd', 'visa'])
+    parser.add_argument('-s', '--subdataset', default='all',
+                        help='One of 15 sub-datasets of Mvtec AD or "all" for all categories')
+    parser.add_argument('-o', '--output_dir', default='experiment_results/seed/90/our_mvtec_10shot')
+    parser.add_argument('-m', '--model_size', default='small',
+                        choices=['small', 'medium'])
+    parser.add_argument('-w', '--weights', default='models/teacher_small.pth')
+    parser.add_argument('-i', '--imagenet_train_path',
+                        default='none',
+                        help='Set to "none" to disable ImageNet' +
+                             'pretraining penalty. Or see README.md to' +
+                             'download ImageNet and set to ImageNet path')
+    parser.add_argument('-a', '--mvtec_ad_path',
+                        default='./mvtec_anomaly_detection',
+                        help='Downloaded Mvtec AD dataset')
+    parser.add_argument('-b', '--mvtec_loco_path',
+                        default='./mvtec_loco_anomaly_detection',
+                        help='Downloaded MVTEC LOCO dataset')
+    parser.add_argument('-c', '--mpdd_path',
+                        default='./dataset/MPDD/MPDD',
+                        help='Downloaded MPDD dataset')
+    parser.add_argument('-e', '--visa_path',
+                        default='./dataset/ViSA',
+                        help='Downloaded VISA dataset')
+    parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for training')
+    parser.add_argument('--data_limit', type=int, default=10, 
+                        help='Limit the number of training samples (e.g., 2, 4, 8)')
+    
+    return parser.parse_args()
+
+class ImageFolderWithoutTarget(ImageFolder):
+    def __getitem__(self, index):
+        sample, target = super().__getitem__(index)
+        return sample
+
+class ImageFolderWithPath(ImageFolder):
+    def __getitem__(self, index):
+        path, target = self.samples[index]
+        sample, target = super().__getitem__(index)
+        return sample, target, path
+
+def InfiniteDataloader(loader):
+    iterator = iter(loader)
+    while True:
+        try:
+            yield next(iterator)
+        except StopIteration:
+            iterator = iter(loader)
+
+seed = 1001
+on_gpu = torch.cuda.is_available()
+image_size = 256
+
+MVTEC_AD_CATEGORIES = [
+    'bottle', 'cable', 'capsule', 'carpet', 'grid',
+    'hazelnut', 'leather', 'metal_nut', 'pill', 'screw',
+    'tile', 'toothbrush', 'transistor', 'wood', 'zipper'
+]
+
+MPDD_CATEGORIES = [
+    'bracket_black', 'bracket_brown', 'bracket_white', 'connector', 'metal_plate', 'tubes'
+]
+
+VISA_CATEGORIES = [
+    'candle', 'capsules', 'cashew', 'chewinggum',
+    'macaroni1', 'macaroni2', 
+    'pcb1', 'pcb2', 'pcb3', 'pcb4',
+    'pipe_fryum',
+]
+
+default_transform = transforms.Compose([
+    transforms.Resize((image_size, image_size)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+transform_ae = transforms.Compose([
+    transforms.RandomRotation(degrees=5),
+    transforms.ColorJitter(
+        brightness=0.15, 
+        contrast=0.15, 
+        saturation=0.1, 
+        hue=0.02
+    ),
+])
+
+def train_transform(image):  
+    return default_transform(image), default_transform(transform_ae(image))
+
+class ResNet18Teacher(nn.Module): 
+    def __init__(self):
+        super(ResNet18Teacher, self).__init__()
+        backbone = models.resnet18(pretrained=True)
+        
+        self.conv1 = backbone.conv1  
+        self.bn1 = backbone.bn1
+        self.relu = backbone.relu
+        self.maxpool = backbone.maxpool
+  
+        self.layer1 = backbone.layer1  
+        self.layer2 = backbone.layer2 
+        self.layer3 = backbone.layer3  
+   
+        self.feat1_channels = 64   
+        self.feat2_channels = 128   
+        self.feat3_channels = 256  
+        
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        
+        feat1 = self.layer1(x)      # 64x64x64
+        feat2 = self.layer2(feat1)  # 128x32x32
+        feat3 = self.layer3(feat2)  # 256x16x16
+        
+        return feat1, feat2, feat3
+
+class Student(nn.Module): #feat2를 입력받아 feat3와 같은 해상도 출력
+    def __init__(self, in_channels=128, out_channels=256):
+        super(Student, self).__init__()
+
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+        )
+        
+    def forward(self, feat2):
+        return self.encoder(feat2)
+
+class Autoencoder(nn.Module): 
+    def __init__(self, in_channels=128, out_channels=512):
+        super(Autoencoder, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels//2, kernel_size=3, stride=1, padding=1), 
+            nn.BatchNorm2d(in_channels//2),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(in_channels//2, in_channels//2, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(in_channels//2),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(in_channels//2, in_channels//4, kernel_size=3, padding=1),
+        )
+        self.decoder = nn.Sequential(
+            nn.Conv2d(in_channels//4, in_channels//2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(in_channels//2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels//2, out_channels, kernel_size=3, padding=1),
+        )
+    def forward(self, feat2):
+        encoded = self.encoder(feat2)  
+        decoded = self.decoder(encoded) 
+        return decoded
+
+class UnifiedDecoder(nn.Module): # 2048x16x16 -> 256x64x64
+    def __init__(self, st_channels=256, ae_channels=256, out_channels=64):
+        super(UnifiedDecoder, self).__init__()
+        self.fusion = nn.Sequential(
+            nn.Conv2d(st_channels * 2, st_channels * 1, kernel_size=3, padding=1),
+            nn.BatchNorm2d(st_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(st_channels, st_channels, kernel_size=3, padding=1),
+        )
+    def forward(self, st_out, ae_out, feat1, feat2, feat3):
+        fused = torch.cat([st_out, ae_out], dim=1)  
+        fused = self.fusion(fused)  
+        return fused
+        
+class AnomalyDetector(nn.Module):
+    def __init__(self, decoder_channels=256, teacher_channels=256):
+        super(AnomalyDetector, self).__init__()
+        self.detector = nn.Sequential(
+            nn.Conv2d(decoder_channels + teacher_channels, (decoder_channels + teacher_channels)//4, kernel_size=3, padding=1),
+            nn.BatchNorm2d((decoder_channels + teacher_channels)//4,),
+            nn.ReLU(inplace=True),
+            nn.Conv2d((decoder_channels + teacher_channels)//4, (decoder_channels + teacher_channels)//8, kernel_size=3, padding=1),
+            nn.BatchNorm2d((decoder_channels + teacher_channels)//8),
+            nn.ReLU(inplace=True),
+            nn.Conv2d((decoder_channels + teacher_channels)//8, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+    def forward(self, decoder_out, teacher_feat1):
+        combined = torch.cat([decoder_out, teacher_feat1], dim=1)
+        anomaly_map = self.detector(combined)
+        return anomaly_map
+
+def reconstruction_loss(decoder_out, teacher_feat1, noise_mask):
+    if noise_mask.shape[2:] != decoder_out.shape[2:]:
+        noise_mask = F.interpolate(noise_mask.float(), size=decoder_out.shape[2:], mode='bilinear', align_corners=False)
+    reconstruction_error = F.mse_loss(decoder_out, teacher_feat1, reduction='none')
+    normal_mask = 1.0 - noise_mask
+    weighted_error = reconstruction_error * (normal_mask + 2.0 * noise_mask)
+    return torch.mean(weighted_error)
+
+def set_global_seed(seed):
+    import random
+    import numpy as np
+    import torch
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def train_single_category(category, config):
+    print(f"\n Training {category}")
+    set_global_seed(seed)
+    
+    if config.dataset == 'mvtec_ad':
+        dataset_path = config.mvtec_ad_path
+    elif config.dataset == 'mvtec_loco':
+        dataset_path = config.mvtec_loco_path
+    elif config.dataset == 'mpdd':
+        dataset_path = config.mpdd_path
+    elif config.dataset == 'visa':
+        dataset_path = config.visa_path
+
+    train_output_dir = os.path.join(config.output_dir, 'trainings',
+                                    config.dataset, category)
+    test_output_dir = os.path.join(config.output_dir, 'anomaly_maps',
+                                   config.dataset, category, 'test')
+    
+    os.makedirs(train_output_dir, exist_ok=True)
+    os.makedirs(test_output_dir, exist_ok=True)
+
+    final_validation_auc = 0.0
+    final_validation_f1 = 0.0
+    final_validation_balanced_acc = 0.0
+    final_pixel_auc = 0.0
+    final_epoch = 0
+
+    training_history = {
+        'epochs': [],
+        'validation_auc': [],
+        'validation_f1': [],
+        'validation_balanced_acc': [],
+        'train_loss': [],
+        'reconstruction_loss': [],
+        'detector_loss': [],
+        'final_epoch': 0,
+        'final_validation_auc': 0.0,
+        'final_validation_f1': 0.0,
+        'final_validation_balanced_acc': 0.0,
+        'final_train_loss': 0.0,
+        'final_reconstruction_loss': 0.0,
+        'final_detector_loss': 0.0
+    }
+    
+    if config.dataset == 'mvtec_ad':
+        full_train_set = ImageFolderWithoutTarget(
+            os.path.join(dataset_path, category, 'train'),
+            transform=transforms.Lambda(train_transform))
+
+        if config.data_limit is not None:
+            torch.manual_seed(seed)
+            indices = torch.randperm(len(full_train_set))[:config.data_limit]
+            full_train_set = torch.utils.data.Subset(full_train_set, indices)
+            print(f" 학습 데이터 {len(full_train_set)}개로 제한됨")
+
+        test_set = ImageFolderWithPath(
+            os.path.join(dataset_path, category, 'test'))
+    
+        train_size = int(1 * len(full_train_set))
+        validation_size = len(full_train_set) - train_size
+        rng = torch.Generator().manual_seed(seed)
+        train_set, validation_set = torch.utils.data.random_split(full_train_set,
+                                                           [train_size,
+                                                            validation_size],
+                                                           rng)
+    elif config.dataset == 'mpdd':
+        full_train_set = ImageFolderWithoutTarget(
+            os.path.join(dataset_path, category, 'train'),
+            transform=transforms.Lambda(train_transform))
+
+        if config.data_limit is not None:
+            torch.manual_seed(seed)
+            indices = torch.randperm(len(full_train_set))[:config.data_limit]
+            full_train_set = torch.utils.data.Subset(full_train_set, indices)
+            print(f"학습 데이터 {len(full_train_set)}개")
+        
+        test_set = ImageFolderWithPath(
+            os.path.join(dataset_path, category, 'test'))
+        
+        train_size = int(1 * len(full_train_set))
+        validation_size = len(full_train_set) - train_size
+        rng = torch.Generator().manual_seed(seed)
+        train_set, validation_set = torch.utils.data.random_split(full_train_set,
+                                                           [train_size,
+                                                            validation_size],
+                                                           rng)
+    elif config.dataset == 'visa':
+        full_train_set = ViSADataset(
+            root_dir=dataset_path,
+            category=category,
+            transform=transforms.Lambda(train_transform),
+            is_train=True,
+            data_limit=config.data_limit
+        )
+        test_set = ViSADataset(
+            root_dir=dataset_path,
+            category=category,
+            is_train=False,
+            return_path=True
+        )
+        print(f"학습 데이터: {len(full_train_set)}개")
+        print(f"테스트 데이터: {len(test_set)}개")
+        train_set = full_train_set
+        validation_set = full_train_set
+    
+    train_loader = DataLoader(train_set, batch_size=config.batch_size, shuffle=True,
+                              num_workers=1, pin_memory=True)
+    validation_loader = DataLoader(full_train_set, batch_size=config.batch_size)
+
+    teacher = ResNet18Teacher()
+    student = Student(in_channels=128, out_channels=256)
+    autoencoder = Autoencoder(in_channels=128, out_channels=256)
+    unified_decoder = UnifiedDecoder(st_channels=256, ae_channels=256, out_channels=256)
+    detector = AnomalyDetector(decoder_channels=256, teacher_channels=256)
+
+    teacher.eval()
+    for param in teacher.parameters():
+        param.requires_grad = False
+        
+    student.train()
+    autoencoder.train()
+    unified_decoder.train()
+    detector.train()
+
+    if on_gpu:
+        teacher.cuda()
+        student.cuda()
+        autoencoder.cuda()
+        unified_decoder.cuda()
+        detector.cuda()
+        
+    main_optimizer = torch.optim.Adam(
+        itertools.chain(
+            student.parameters(),
+            autoencoder.parameters(),
+            unified_decoder.parameters(),
+        ),
+        lr=3e-4, weight_decay=1e-5, betas=(0.9, 0.99),
+    )
+    
+    detector_optimizer = torch.optim.Adam(
+        detector.parameters(),
+        lr=3e-4, weight_decay=1e-5, betas=(0.9, 0.99),
+    )
+    
+    main_scheduler = torch.optim.lr_scheduler.StepLR(
+        main_optimizer, step_size=max(1, config.epochs//2), gamma=0.5
+    )
+    
+    detector_scheduler = torch.optim.lr_scheduler.StepLR(
+        detector_optimizer, step_size=max(1, config.epochs//2), gamma=0.5
+    )
+
+    train_start_time = time.perf_counter()
+    
+    total_loss_list = []
+    st_loss_list = []
+    ae_loss_list = []
+    recon_loss_list = []
+    det_loss_list = []
+
+    for epoch in range(config.epochs):
+        student.train()
+        autoencoder.train()
+        unified_decoder.train()
+        detector.train()
+        epoch_loss = 0.0
+        epoch_st_loss = 0.0
+        epoch_ae_loss = 0.0
+        epoch_recon_loss = 0.0
+        epoch_detector_loss = 0.0
+        tqdm_obj = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs}")
+        
+        for batch_idx, (image_st, image_ae) in enumerate(tqdm_obj):
+            if on_gpu:
+                image_st = image_st.cuda()
+                image_ae = image_ae.cuda()
+            
+            with torch.no_grad():
+                feat1, feat2, feat3 = teacher(image_st)
+
+            noise_vis_dir = os.path.join(train_output_dir, 'noise_visualization')
+            
+            noised_image, noise_mask = adaptive_gradcam_noise(teacher, image_st, 0.05, 
+                                        multiple_layers=['layer1', 'layer2', 'layer3'],
+                                        ensemble_weights=[0.5, 0, 0.5],
+                                        visualize_noise=False, 
+                                        save_dir=None)
+            
+            with torch.no_grad():
+                feat1_noisy, feat2_noisy, feat3_noisy = teacher(noised_image)
+            
+            st_out_clean = student(feat2)
+            st_out = student(feat2_noisy)
+            
+            ae_out_clean = autoencoder(feat2)
+            ae_out = autoencoder(feat2_noisy)
+            
+            student_loss = F.mse_loss(st_out, feat3)
+            student_loss += F.mse_loss(st_out_clean, feat3)
+
+            ae_loss = F.mse_loss(ae_out, feat3)
+            ae_loss += F.mse_loss(ae_out_clean, feat3)
+
+            decoder_out = unified_decoder(st_out, ae_out, feat1, feat2, feat3)
+            decoder_out_clean = unified_decoder(st_out_clean, ae_out_clean, feat1, feat2, feat3)
+
+            noisy_target = F.interpolate(noise_mask.float(), size=feat3.shape[2:], mode='bilinear', align_corners=False)
+
+            recon_loss = reconstruction_loss(decoder_out_clean, feat3, torch.zeros_like(noise_mask))
+            recon_loss += reconstruction_loss(decoder_out, feat3, noise_mask) # noisy output 
+            
+            total_loss = student_loss + ae_loss + recon_loss
+            
+            main_optimizer.zero_grad()
+            total_loss.backward()
+            main_optimizer.step()
+            
+            detector_optimizer.zero_grad()
+            
+            decoder_out_clean = decoder_out_clean.detach()
+
+            anomaly_map_clean = detector(decoder_out_clean, feat3)
+            anomaly_map_noisy = detector(decoder_out.detach(), feat3_noisy)
+            
+            clean_target = torch.zeros_like(anomaly_map_clean)
+            noisy_target = F.interpolate(noise_mask.float(), size=anomaly_map_noisy.shape[2:], mode='bilinear', align_corners=False)
+            
+            detector_loss = F.binary_cross_entropy(anomaly_map_clean, clean_target) + \
+                            F.binary_cross_entropy(anomaly_map_noisy, noisy_target)
+            
+            detector_loss.backward()
+            detector_optimizer.step()
+            
+            epoch_loss += total_loss.item()
+            epoch_st_loss += student_loss.item()
+            epoch_ae_loss += ae_loss.item()
+            epoch_recon_loss += recon_loss.item()
+            epoch_detector_loss += detector_loss.item()
+            tqdm_obj.set_postfix({
+                'Total': total_loss.item(),
+                'ST': student_loss.item(),
+                'AE': ae_loss.item(),
+                'Recon': recon_loss.item(),
+                'Det': detector_loss.item()
+            })
+        
+        main_scheduler.step()
+        detector_scheduler.step()
+        
+        training_history['epochs'].append(epoch)
+        training_history['train_loss'].append(epoch_loss / len(train_loader))
+        training_history['reconstruction_loss'].append(epoch_recon_loss / len(train_loader))
+        training_history['detector_loss'].append(epoch_detector_loss / len(train_loader))
+        
+        total_loss_list.append(epoch_loss / len(train_loader))
+        st_loss_list.append(epoch_st_loss / len(train_loader))
+        ae_loss_list.append(epoch_ae_loss / len(train_loader))
+        recon_loss_list.append(epoch_recon_loss / len(train_loader))
+        det_loss_list.append(epoch_detector_loss / len(train_loader))
+
+        if epoch == config.epochs - 1:
+            print(f'\nFinal evaluation for {category}...')
+
+            student.eval()
+            autoencoder.eval()
+            unified_decoder.eval()
+            detector.eval()
+            
+            metrics = test_image_level_only(
+                test_set=test_set, teacher=teacher, student=student,
+                autoencoder=autoencoder, unified_decoder=unified_decoder,
+                pixel_detector=detector,
+                desc=f' Final Evaluation (epoch {epoch+1})', 
+                fixed_threshold=0.1,
+                save_anomaly_map_dir=None
+            )
+
+            current_auc = metrics['image_auc']
+            current_f1 = metrics['image_f1'] 
+            current_balanced_acc = metrics['image_balanced_accuracy']
+            
+            training_history['validation_auc'].append(current_auc)
+            training_history['validation_f1'].append(current_f1)
+            training_history['validation_balanced_acc'].append(current_balanced_acc)
+            
+            final_validation_auc = current_auc
+            final_validation_f1 = current_f1
+            final_validation_balanced_acc = current_balanced_acc
+            final_epoch = epoch
+            
+            print(f'\n {category} Final Results (Epoch {epoch+1}):')
+            print(f'Image AUC: {final_validation_auc:.2f}%  |  F1: {final_validation_f1:.2f}%')
+            print(f'Final model at epoch {final_epoch+1} - Image AUC: {final_validation_auc:.2f}%')
+
+            student.train()
+            autoencoder.train()
+            unified_decoder.train()
+            detector.train()
+        else:
+            training_history['validation_auc'].append(0.0)
+            training_history['validation_f1'].append(0.0)
+            training_history['validation_balanced_acc'].append(0.0)
+
+    train_end_time = time.perf_counter()
+    total_train_time = (train_end_time - train_start_time)
+
+    epoch_losses = []
+    for epoch in range(len(total_loss_list)):
+        epoch_losses.append([
+            epoch+1,
+            total_loss_list[epoch],
+            st_loss_list[epoch],
+            ae_loss_list[epoch],
+            recon_loss_list[epoch],
+            det_loss_list[epoch]
+        ])
+    csv_path = os.path.join(train_output_dir, 'loss_per_epoch.csv')
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['epoch', 'total_loss', 'st_loss', 'ae_loss', 'recon_loss', 'det_loss'])
+        writer.writerows(epoch_losses)
+    print(f"Per-epoch loss saved to {csv_path}")
+    
+    print(f"\nFinal evaluation for {category} with LAST EPOCH MODEL...")
+    
+    teacher.eval()
+    student.eval()
+    autoencoder.eval()
+    unified_decoder.eval()
+    detector.eval()
+    
+    final_metrics = test_image_level_only(
+        test_set=test_set, teacher=teacher, student=student,
+        autoencoder=autoencoder, unified_decoder=unified_decoder, 
+        pixel_detector=detector,
+        desc='FINAL TEST', 
+        fixed_threshold=0.1,
+        save_anomaly_map_dir=None
+    )
+
+    inference_time = final_metrics.get('inference_time', 0.0)
+    inference_time_per_image = final_metrics.get('inference_time_per_image', 0.0)
+    
+    print(f"\n Training completed for {category}!")
+    print(f" Total training time: {total_train_time:.2f}s")
+    print(f" Final Image AUC: {final_validation_auc:.2f}% at epoch {final_epoch+1}")
+    print(f" Inference time: {inference_time:.2f}s ({inference_time_per_image:.2f}ms per image)")
+    
+    final_pixel_auc = 0.0 
+    print(f"\n Training completed for {category}!")
+    print(f" Total training time: {total_train_time:.2f}s")
+    print(f" Final Image AUC: {final_validation_auc:.2f}% at epoch {final_epoch+1}")
+    
+    final_checkpoint = {
+        'epoch': final_epoch,
+        'category': category,
+        'teacher_state_dict': teacher.state_dict(),
+        'student_state_dict': student.state_dict(),
+        'autoencoder_state_dict': autoencoder.state_dict(),
+        'unified_decoder_state_dict': unified_decoder.state_dict(),
+        'pixel_detector_state_dict': detector.state_dict(),
+        'final_metrics': final_metrics,
+        'final_image_auc': final_validation_auc,
+        'final_f1': final_validation_f1,
+        'final_balanced_acc': final_validation_balanced_acc,
+        'training_history': training_history
+    }
+
+    final_model_dir = os.path.join(train_output_dir, 'final_model')
+    os.makedirs(final_model_dir, exist_ok=True)
+    torch.save(final_checkpoint, os.path.join(final_model_dir, 'final_model.pth'))
+    
+    result = {
+        'category': category,
+        'final_epoch': final_epoch,
+        'training_time': total_train_time,
+        'image_auc': final_validation_auc,
+        'image_f1': final_validation_f1,
+        'image_balanced_accuracy': final_validation_balanced_acc,
+        'training_history': training_history,
+        'inference_time': inference_time,
+        'inference_time_per_image': inference_time_per_image,
+        'test_samples': len(test_set)
+    }
+    return result
+
+@torch.no_grad()
+def predict(image, teacher, student, autoencoder, unified_decoder, pixel_detector):
+    feat1, feat2, feat3 = teacher(image)  # feat1: 64x64x64, feat2: 128x32x32, feat3: 256x16x16
+
+    st_out = student(feat2)    
+    ae_out = autoencoder(feat2)
+    
+    decoder_out = unified_decoder(st_out, ae_out, feat1, feat2, feat3)  
+    anomaly_map = pixel_detector(decoder_out, feat3)
+    
+    map_st = torch.mean((feat3 - st_out)**2, dim=1, keepdim=True)  
+    map_ae = torch.mean((feat3 - ae_out)**2, dim=1, keepdim=True)  
+    map_recon = torch.mean((feat3 - decoder_out)**2, dim=1, keepdim=True) 
+    
+    target_size = anomaly_map.shape[2:] 
+    
+    map_st_upsampled = F.interpolate(map_st, size=target_size, mode='bilinear', align_corners=False)
+    map_ae_upsampled = F.interpolate(map_ae, size=target_size, mode='bilinear', align_corners=False)
+
+    map_combined = 0.2 * anomaly_map + 0.3 * map_st_upsampled + 0.3 * map_ae_upsampled + 0.2 * map_recon
+    
+    return map_combined, map_st_upsampled, map_ae_upsampled, map_recon
+
+def test_image_level_only(test_set, teacher, student, autoencoder, unified_decoder, pixel_detector,
+                         desc='Running image-level inference', fixed_threshold=0.1,
+                         save_anomaly_map_dir=None):
+    
+    pure_inference_start = time.perf_counter()
+    
+    y_true_image = []
+    y_score_image = []
+    save_data = []
+    
+    for image, target, path in tqdm(test_set, desc=desc):
+        orig_width = image.width
+        orig_height = image.height
+        image_tensor = default_transform(image)
+        image_tensor = image_tensor[None]
+        if on_gpu:
+            image_tensor = image_tensor.cuda()
+          
+        map_combined, map_st, map_ae, map_recon = predict(
+            image=image_tensor, teacher=teacher, student=student,
+            autoencoder=autoencoder, unified_decoder=unified_decoder,
+            pixel_detector=pixel_detector
+        )
+        
+        map_combined = torch.nn.functional.pad(map_combined, (4, 4, 4, 4))
+        map_combined = torch.nn.functional.interpolate(
+            map_combined, (orig_height, orig_width), mode='bilinear')
+        map_combined_np = map_combined[0, 0].cpu().numpy()
+
+        defect_class = os.path.basename(os.path.dirname(path))
+        
+        y_true_image_single = 0 if (defect_class == 'good' or defect_class == 'Normal') else 1
+        y_score_image_single = np.max(map_combined_np) 
+        y_true_image.append(y_true_image_single)
+        y_score_image.append(y_score_image_single)
+      
+        if save_anomaly_map_dir is not None:
+            save_data.append({
+                'map_combined_np': map_combined_np,
+                'path': path,
+                'target': y_true_image_single,
+                'defect_class': defect_class
+            })
+
+    pure_inference_end = time.perf_counter()
+    pure_inference_time = (pure_inference_end - pure_inference_start)
+    pure_inference_time_per_image = pure_inference_time * 1000 / len(test_set)
+    
+    print(f"Pure inference time: {pure_inference_time:.2f}s ({pure_inference_time_per_image:.2f}ms per image)")
+  
+    if save_anomaly_map_dir is not None:
+        save_start_time = time.perf_counter()
+        
+        global_min = min(np.min(data['map_combined_np']) for data in save_data)
+        global_max = max(np.max(data['map_combined_np']) for data in save_data)
+        
+        print(f"Global anomaly score range: {global_min:.6f} ~ {global_max:.6f}")
+        
+        for data in save_data:
+            map_combined_np = data['map_combined_np']
+            path = data['path']
+            target = data['target']
+            defect_class = data['defect_class']
+            
+            base_name = os.path.splitext(os.path.basename(path))[0]
+            
+            save_dir = os.path.join(save_anomaly_map_dir, defect_class)
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, f"{base_name}_anomaly_map.png")
+            
+            if global_max > global_min:
+                norm_map = (map_combined_np - global_min) / (global_max - global_min)
+            else:
+                norm_map = np.zeros_like(map_combined_np)
+            
+            anomaly_map_uint8 = (norm_map * 255).astype(np.uint8)
+            Image.fromarray(anomaly_map_uint8).save(save_path)
+            
+            raw_save_path = os.path.join(save_dir, f"{base_name}_raw_score.txt")
+            with open(raw_save_path, 'w') as f:
+                f.write(f"Max anomaly score: {np.max(map_combined_np):.6f}\n")
+                f.write(f"Mean anomaly score: {np.mean(map_combined_np):.6f}\n")
+                f.write(f"Target: {target} ({'Normal' if target == 0 else 'Anomaly'})\n")
+        
+        save_end_time = time.perf_counter()
+        save_time = (save_end_time - save_start_time)
+        save_time_per_image = save_time * 1000 / len(test_set)
+        
+        print(f" Save time: {save_time:.2f}s ({save_time_per_image:.2f}ms per image)")
+        print(f" Total time: {pure_inference_time + save_time:.2f}s")
+        
+        total_time = pure_inference_time + save_time
+        total_time_per_image = total_time * 1000 / len(test_set)
+    else:
+        total_time = pure_inference_time
+        total_time_per_image = pure_inference_time_per_image
+
+    image_metrics = calculate_metrics_fixed_threshold(y_true_image, y_score_image, fixed_threshold)
+    
+    return {
+        'image_auc': image_metrics['auc'],       
+        'image_auroc': image_metrics['auroc'],   
+        'image_f1': image_metrics['f1'],          
+        'image_balanced_accuracy': image_metrics['balanced_accuracy'],  
+        'threshold_fixed': fixed_threshold,
+        'pure_inference_time': pure_inference_time,
+        'pure_inference_time_per_image': pure_inference_time_per_image,
+        'inference_time': total_time,
+        'inference_time_per_image': total_time_per_image
+    }
+
+def calculate_metrics_fixed_threshold(y_true, y_score, fixed_threshold=0.1): # threshold 0.1로 고정 
+    y_true = np.array(y_true)
+    y_score = np.array(y_score)
+
+    y_pred_fixed = (y_score >= fixed_threshold).astype(int)
+    
+    auc = roc_auc_score(y_true, y_score) * 100
+    auroc = roc_auc_score(y_true, y_score) * 100
+
+    f1_fixed = f1_score(y_true, y_pred_fixed) * 100
+    balanced_acc_fixed = balanced_accuracy_score(y_true, y_pred_fixed) * 100
+
+    return {
+        'auc': auc,
+        'auroc': auroc,
+        'f1': f1_fixed,
+        'balanced_accuracy': balanced_acc_fixed,
+        'threshold_fixed': fixed_threshold
+    }
+
+def main():
+    set_global_seed(seed)
+    config = get_argparse()
+    
+    if config.subdataset == 'all':
+        if config.dataset == 'mvtec_ad':
+            categories = MVTEC_AD_CATEGORIES
+        elif config.dataset == 'mpdd':
+            categories = MPDD_CATEGORIES
+        elif config.dataset == 'visa':
+            categories = VISA_CATEGORIES
+        else:
+            raise ValueError("--subdataset all is only supported for mvtec_ad")
+    else:
+        categories = [config.subdataset]
+    
+    print(f" Starting WideResNet101 experiments for {len(categories)} categories: {categories}")
+    
+    all_results = []
+    total_start_time = time.perf_counter()
+    
+    for i, category in enumerate(categories):
+        print(f"\n{'='*80}")
+        print(f" CATEGORY {i+1}/{len(categories)}: {category.upper()}")
+        print(f"{'='*80}")
+        
+        try:
+            result = train_single_category(category, config)
+            all_results.append(result)
+            
+            print(f"\n {category} completed!")
+            print(f" Results: Image AUC: {result['image_auc']:.2f}%, F1: {result['image_f1']:.2f}%")
+            print(f" Inference: {result['inference_time']:.2f}s ({result['inference_time_per_image']:.2f}ms per image)")
+            
+            
+        except Exception as e:
+            print(f" Error in {category}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    total_end_time = time.perf_counter()
+    total_time = total_end_time - total_start_time
+    
+    print(f"\n{'='*100}")
+    print(f" FINAL RESULTS SUMMARY - ALL CATEGORIES")
+    print(f"{'='*100}")
+    print(f"Total experiment time: {total_time:.2f}s ({total_time/60:.1f} minutes)")
+    print(f"Successfully completed: {len(all_results)}/{len(categories)} categories")
+    
+    if all_results:
+        inference_times = [r['inference_time'] for r in all_results]
+        inference_times_per_image = [r['inference_time_per_image'] for r in all_results]
+        total_test_samples = sum([r['test_samples'] for r in all_results])
+        
+        avg_inference_time = np.mean(inference_times)
+        avg_inference_time_per_image = np.mean(inference_times_per_image)
+        std_inference_time = np.std(inference_times)
+        std_inference_time_per_image = np.std(inference_times_per_image)
+        
+        results_df = pd.DataFrame([
+            {
+                'Category': result['category'],
+                'Image_AUC': f"{result['image_auc']:.2f}%",
+                'Image_F1': f"{result['image_f1']:.2f}%", 
+                'Balanced_Acc': f"{result['image_balanced_accuracy']:.2f}%",
+                'Final_Epoch': result['final_epoch'],
+                'Training_Time': f"{result['training_time']:.1f}s",
+                'Inference_Time': f"{result['inference_time']:.2f}s",
+                'Inference_Per_Image': f"{result['inference_time_per_image']:.2f}ms",
+                'Test_Samples': result['test_samples']
+            }
+            for result in all_results
+        ])
+        
+        print(f"\n DETAILED RESULTS:")
+        print(results_df.to_string(index=False))
+    
+        avg_image_auc = np.mean([r['image_auc'] for r in all_results])
+        avg_image_f1 = np.mean([r['image_f1'] for r in all_results])
+        avg_balanced_acc = np.mean([r['image_balanced_accuracy'] for r in all_results])
+        
+        print(f"\n AVERAGE PERFORMANCE:")
+        print(f"Average Image AUC: {avg_image_auc:.2f}%")
+        print(f"Average Image F1: {avg_image_f1:.2f}%")
+        print(f"Average Balanced Accuracy: {avg_balanced_acc:.2f}%")
+
+        print(f"\n INFERENCE TIME STATISTICS:")
+        print(f"Average Inference Time: {avg_inference_time:.2f}s ± {std_inference_time:.2f}s")
+        print(f"Average Inference Time Per Image: {avg_inference_time_per_image:.2f}ms ± {std_inference_time_per_image:.2f}ms")
+        print(f"Total Test Samples: {total_test_samples}")
+        print(f"Total Inference Time: {sum(inference_times):.2f}s")
+        
+        fastest_result = min(all_results, key=lambda x: x['inference_time_per_image'])
+        slowest_result = max(all_results, key=lambda x: x['inference_time_per_image'])
+        
+        print(f"Fastest: {fastest_result['category']} ({fastest_result['inference_time_per_image']:.2f}ms per image)")
+        print(f"Slowest: {slowest_result['category']} ({slowest_result['inference_time_per_image']:.2f}ms per image)")
+        
+        best_image_auc_result = max(all_results, key=lambda x: x['image_auc'])
+        
+        print(f"\n BEST PERFORMERS:")
+        print(f"Best Image AUC: {best_image_auc_result['category']} ({best_image_auc_result['image_auc']:.2f}%)")
+        
+        output_dir = config.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        
+        results_df.to_csv(os.path.join(output_dir, 'wideresnet_results.csv'), index=False)
+        
+        detailed_results = {
+            'experiment_info': {
+                'architecture': 'WideResNet101_Modified',
+                'dataset': config.dataset,
+                'data_limit': config.data_limit,
+                'epochs': config.epochs,
+                'batch_size': config.batch_size,
+                'total_time': total_time,
+                'completed_categories': len(all_results),
+                'total_categories': len(categories)
+            },
+            'average_performance': {
+                'image_auc': avg_image_auc,
+                'image_f1': avg_image_f1,
+                'balanced_accuracy': avg_balanced_acc
+            },
+            'inference_statistics': {
+                'average_inference_time': avg_inference_time,
+                'std_inference_time': std_inference_time,
+                'average_inference_time_per_image': avg_inference_time_per_image,
+                'std_inference_time_per_image': std_inference_time_per_image,
+                'total_test_samples': total_test_samples,
+                'total_inference_time': sum(inference_times),
+                'fastest_category': fastest_result['category'],
+                'fastest_time': fastest_result['inference_time_per_image'],
+                'slowest_category': slowest_result['category'],
+                'slowest_time': slowest_result['inference_time_per_image']
+            },
+            'best_performers': {
+                'best_image_auc': {
+                    'category': best_image_auc_result['category'],
+                    'score': best_image_auc_result['image_auc']
+                }
+            },
+            'detailed_results': all_results
+        }
+        
+        with open(os.path.join(output_dir, 'wideresnet_detailed_results.json'), 'w') as f:
+            json.dump(detailed_results, f, indent=2, default=str)
+        
+        print(f"\n Results saved to:")
+        print(f"  - {os.path.join(output_dir, 'wideresnet_results.csv')}")
+        print(f"  - {os.path.join(output_dir, 'wideresnet_detailed_results.json')}")
+        
+    print(f"\n{'='*100}")
+
+class GradCAM:
+    def __init__(self, model, target_layer_name):
+        self.model = model
+        self.target_layer_name = target_layer_name
+        self.gradients = None
+        self.activations = None
+        self.hooks = []
+        self._register_hooks()
+    
+    def _register_hooks(self):
+        """Forward/Backward hook 등록"""
+        def forward_hook(module, input, output):
+            self.activations = output.detach()
+        
+        def backward_hook(module, grad_input, grad_output):
+            if grad_output[0] is not None:
+                self.gradients = grad_output[0].detach()
+        
+        for name, module in self.model.named_modules():
+            if name == self.target_layer_name:
+                handle_f = module.register_forward_hook(forward_hook)
+                handle_b = module.register_backward_hook(backward_hook)
+                self.hooks.extend([handle_f, handle_b])
+                break
+    
+    def generate_cam_lightweight(self, input_tensor, score_method='mean'):
+        target_module = None
+        for name, module in self.model.named_modules():
+            if name == self.target_layer_name:
+                target_module = module
+                break
+        
+        if target_module is None:
+            return torch.zeros((1, 1, 64, 64), device=input_tensor.device)
+        
+        original_requires_grad = {}
+        for param in target_module.parameters():
+            original_requires_grad[id(param)] = param.requires_grad
+            param.requires_grad_(True)
+        
+        self.model.eval()
+        try:
+            output = self.model(input_tensor)
+            if isinstance(output, tuple):
+                if 'layer1' in self.target_layer_name:
+                    target_output = output[0]
+                elif 'layer2' in self.target_layer_name:
+                    target_output = output[1]
+                elif 'layer3' in self.target_layer_name:
+                    target_output = output[2]
+                else:
+                    target_output = output[0]
+            else:
+                target_output = output
+            
+            if score_method == 'mean':
+                score = torch.mean(target_output)
+            elif score_method == 'max':
+                score = torch.max(target_output)
+            else:  
+                variance = torch.var(target_output, dim=1, keepdim=True)
+                weighted_score = torch.sum(target_output * variance) / torch.sum(variance)
+                score = weighted_score
+            
+            self.model.zero_grad()
+            score.backward(retain_graph=False)
+            
+            if self.gradients is None or self.activations is None:
+                return torch.zeros((1, 1, target_output.shape[2], target_output.shape[3]), 
+                                 device=input_tensor.device)
+            
+            gradients = self.gradients
+            activations = self.activations
+            
+            grad_2 = gradients.pow(2)
+            grad_3 = gradients.pow(3)
+            
+            alpha_denom = grad_2.mul(2.0)
+            alpha_denom.add_(torch.sum(activations * grad_3, dim=[2, 3], keepdim=True))
+            alpha = grad_2.div(alpha_denom + 1e-7)
+            
+            weights = torch.sum(alpha * F.relu(gradients), dim=[2, 3], keepdim=True)
+
+            cam = torch.sum(weights * activations, dim=1, keepdim=True)
+            cam = F.relu(cam)
+ 
+            B, _, H, W = cam.shape
+            cam_flat = cam.view(B, -1)
+            cam_min = torch.min(cam_flat, dim=1, keepdim=True)[0].view(B, 1, 1, 1)
+            cam_max = torch.max(cam_flat, dim=1, keepdim=True)[0].view(B, 1, 1, 1)
+            cam = (cam - cam_min) / (cam_max - cam_min + 1e-7)
+            
+            return cam
+            
+        finally:
+            for param in target_module.parameters():
+                param.requires_grad_(original_requires_grad[id(param)])
+            
+            if hasattr(self, 'gradients') and self.gradients is not None:
+                del self.gradients
+            if hasattr(self, 'activations') and self.activations is not None:
+                del self.activations
+            self.gradients = None
+            self.activations = None
+    
+    def remove_hooks(self):
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks.clear()
+        
+        if hasattr(self, 'gradients'):
+            del self.gradients
+        if hasattr(self, 'activations'):
+            del self.activations
+        self.gradients = None
+        self.activations = None
+
+def get_largest_component(mask):
+    num_labels, labels = cv2.connectedComponents(mask.astype(np.uint8))
+    
+    if num_labels <= 1:
+        return mask
+       
+    largest_size = 0
+    largest_label = 0
+    
+    for label_id in range(1, num_labels):
+        size = np.sum(labels == label_id)
+        if size > largest_size:
+            largest_size = size
+            largest_label = label_id
+    
+    if largest_label > 0:
+        return (labels == largest_label).astype(np.float32)
+    else:
+        return np.zeros_like(mask)
+
+def adaptive_gradcam_noise(teacher, image, noise_std=0.05, 
+                          multiple_layers=['layer1', 'layer2','layer3'], 
+                          ensemble_weights=[0.5, 0, 0.5],
+                          visualize_noise=False, save_dir=None):
+    
+    B, C, H, W = image.shape
+    device = image.device
+
+    cams = []
+    for layer_name in multiple_layers:
+        gradcam = GradCAM(teacher, layer_name)
+        try:
+            for b in range(B):
+                single_image = image[b:b+1]
+                cam = gradcam.generate_cam_lightweight(single_image, score_method='adaptive') 
+                cam_full = F.interpolate(cam, size=(H, W), mode='bilinear', align_corners=False)
+                cams.append(cam_full[0, 0])
+        finally:
+            gradcam.remove_hooks()
+            del gradcam
+            torch.cuda.empty_cache() 
+
+    ensemble_cam = torch.zeros((B, H, W), device=device)
+    for b in range(B):
+        weighted_cam = torch.zeros((H, W), device=device)
+        for i, weight in enumerate(ensemble_weights):
+            cam_idx = b * len(multiple_layers) + i
+            if cam_idx < len(cams):
+                weighted_cam += weight * cams[cam_idx]
+        ensemble_cam[b] = weighted_cam
+    
+    noised_images = []
+    noise_masks = []
+    
+    visualization_info = []
+    
+    for b in range(B):
+        single_image = image[b:b+1]
+        cam_np = ensemble_cam[b].detach().cpu().numpy() 
+
+        cam_uint8 = (cam_np * 255).astype(np.uint8)
+        threshold_val, _ = cv2.threshold(cam_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        threshold = threshold_val / 255.0
+        
+        object_mask = (cam_np > threshold).astype(np.float32)
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))  
+        object_mask = cv2.morphologyEx(object_mask, cv2.MORPH_CLOSE, kernel)
+        object_mask = cv2.morphologyEx(object_mask, cv2.MORPH_OPEN, kernel)
+ 
+        noised_image = single_image.clone()
+        obj_pixels = np.where(object_mask > 0.7)
+        
+        batch_vis_info = {
+            'original_image': single_image[0].cpu().numpy(),
+            'cam': cam_np,
+            'object_mask': object_mask,
+            'noise_patches': [],
+            'defect_patterns': [],
+            'patch_coordinates': []
+        }
+        
+        if len(obj_pixels[0]) > 0:
+            object_area = np.sum(object_mask)
+            num_patches = max(1, min(3, int(object_area / (H * W) * 10)))  # 최대 3개까지 패치 생성
+            
+            noise_mask_feat1 = torch.zeros((1, 1, H // 4, W // 4), device=device)
+            
+            for patch_idx in range(num_patches):  
+                random_idx = random.randint(0, len(obj_pixels[0]) - 1)
+                center_y, center_x = obj_pixels[0][random_idx], obj_pixels[1][random_idx]
+                
+                defect_pattern = random.choice(['spot', 'line', 'area'])
+                
+                patch_info = {
+                    'center': (center_y, center_x),
+                    'defect_pattern': defect_pattern
+                }
+                
+                if defect_pattern == 'spot':
+                    patch_size = 8
+                    half_patch = patch_size // 2
+                    
+                    target_y1 = max(0, center_y - half_patch)
+                    target_y2 = min(H, center_y + half_patch)
+                    target_x1 = max(0, center_x - half_patch)
+                    target_x2 = min(W, center_x + half_patch)
+                    
+                    source_y = random.randint(0, H - patch_size)
+                    source_x = random.randint(0, W - patch_size)
+
+                    while (abs(source_y - center_y) < patch_size and abs(source_x - center_x) < patch_size):
+                        source_y = random.randint(0, H - patch_size)
+                        source_x = random.randint(0, W - patch_size)
+                    
+                    source_patch = noised_image[0, :, source_y:source_y+patch_size, source_x:source_x+patch_size].clone()
+                    
+                    if target_y2 - target_y1 > 0 and target_x2 - target_x1 > 0:
+                        noised_image[0, :, target_y1:target_y2, target_x1:target_x2] = source_patch[:, :target_y2-target_y1, :target_x2-target_x1]
+                    
+                    patch_info['coordinates'] = (target_y1, target_y2, target_x1, target_x2)
+                    patch_info['source_coordinates'] = (source_y, source_y+patch_size, source_x, source_x+patch_size)
+                    patch_info['patch_size'] = patch_size
+                    patch_info['noise_type'] = 'spot_augmentation'
+                
+                elif defect_pattern == 'line':
+                    line_width = random.randint(2, 4)
+                    line_length = random.randint(20, 60)
+                    
+                    is_vertical = random.choice([True, False])
+                    
+                    if is_vertical:
+                        line_y1 = max(0, center_y - line_length // 2)
+                        line_y2 = min(H, center_y + line_length // 2)
+                        line_x1 = max(0, center_x - line_width // 2)
+                        line_x2 = min(W, center_x + line_width // 2)
+                        
+                        source_y = random.randint(0, max(1, H - (line_y2 - line_y1)))
+                        source_x = random.randint(0, max(1, W - line_width))
+                        
+                        source_line = noised_image[0, :, source_y:source_y+(line_y2-line_y1), source_x:source_x+line_width].clone()
+                        
+                        if line_y2 - line_y1 > 0 and line_x2 - line_x1 > 0:
+                            noised_image[0, :, line_y1:line_y2, line_x1:line_x2] = source_line[:, :line_y2-line_y1, :line_x2-line_x1]
+                        
+                        patch_info['coordinates'] = (line_y1, line_y2, line_x1, line_x2)
+                        patch_info['source_coordinates'] = (source_y, source_y+(line_y2-line_y1), source_x, source_x+line_width)
+                    else:
+                        line_y1 = max(0, center_y - line_width // 2)
+                        line_y2 = min(H, center_y + line_width // 2)
+                        line_x1 = max(0, center_x - line_length // 2)
+                        line_x2 = min(W, center_x + line_length // 2)
+                        
+                        source_y = random.randint(0, max(1, H - line_width))
+                        source_x = random.randint(0, max(1, W - (line_x2 - line_x1)))
+
+                        source_line = noised_image[0, :, source_y:source_y+line_width, source_x:source_x+(line_x2-line_x1)].clone()
+    
+                        if line_y2 - line_y1 > 0 and line_x2 - line_x1 > 0:
+                            noised_image[0, :, line_y1:line_y2, line_x1:line_x2] = source_line[:, :line_y2-line_y1, :line_x2-line_x1]
+                        
+                        patch_info['coordinates'] = (line_y1, line_y2, line_x1, line_x2)
+                        patch_info['source_coordinates'] = (source_y, source_y+line_width, source_x, source_x+(line_x2-line_x1))
+                    
+                    patch_info['line_width'] = line_width
+                    patch_info['line_length'] = line_length
+                    patch_info['is_vertical'] = is_vertical
+                    patch_info['noise_type'] = 'line_augmentation'
+                
+                elif defect_pattern == 'area':
+                    rect_width = random.randint(20, 40)
+                    rect_height = random.randint(20, 40)
+                    
+                    area_y1 = max(0, center_y - rect_height // 2)
+                    area_y2 = min(H, center_y + rect_height // 2)
+                    area_x1 = max(0, center_x - rect_width // 2)
+                    area_x2 = min(W, center_x + rect_width // 2)
+                    
+                    actual_height = area_y2 - area_y1
+                    actual_width = area_x2 - area_x1
+                    
+                    source_y = random.randint(0, max(1, H - actual_height))
+                    source_x = random.randint(0, max(1, W - actual_width))
+
+                    while (abs(source_y - center_y) < actual_height and abs(source_x - center_x) < actual_width):
+                        source_y = random.randint(0, max(1, H - actual_height))
+                        source_x = random.randint(0, max(1, W - actual_width))
+   
+                    source_area = noised_image[0, :, source_y:source_y+actual_height, source_x:source_x+actual_width].clone()
+                    
+                    if actual_height > 0 and actual_width > 0:
+                        noised_image[0, :, area_y1:area_y2, area_x1:area_x2] = source_area
+                    
+                    patch_info['coordinates'] = (area_y1, area_y2, area_x1, area_x2)
+                    patch_info['source_coordinates'] = (source_y, source_y+actual_height, source_x, source_x+actual_width)
+                    patch_info['rect_width'] = rect_width
+                    patch_info['rect_height'] = rect_height
+                    patch_info['noise_type'] = 'area_augmentation'
+
+                y1, y2, x1, x2 = patch_info['coordinates']
+      
+                y1_feat = max(0, y1 // 4)
+                y2_feat = min(H // 4, y2 // 4)
+                x1_feat = max(0, x1 // 4)
+                x2_feat = min(W // 4, x2 // 4)
+                
+                if y2_feat > y1_feat and x2_feat > x1_feat:
+                    if defect_pattern == 'spot':
+                        noise_mask_feat1[0, 0, y1_feat:y2_feat, x1_feat:x2_feat] = 1.0
+                    
+                    elif defect_pattern == 'line':
+                        if patch_info['is_vertical']:
+                            center_x_feat = (x1_feat + x2_feat) // 2
+                            for y_feat in range(y1_feat, y2_feat):
+                                for x_offset in range(max(1, patch_info['line_width'] // 4)):
+                                    x_feat = center_x_feat + x_offset - patch_info['line_width'] // 8
+                                    if 0 <= x_feat < W // 4:
+                                        noise_mask_feat1[0, 0, y_feat, x_feat] = 1.0
+                        else:
+                            center_y_feat = (y1_feat + y2_feat) // 2
+                            for x_feat in range(x1_feat, x2_feat):
+                                for y_offset in range(max(1, patch_info['line_width'] // 4)):
+                                    y_feat = center_y_feat + y_offset - patch_info['line_width'] // 8
+                                    if 0 <= y_feat < H // 4:
+                                        noise_mask_feat1[0, 0, y_feat, x_feat] = 1.0
+                    
+                    elif defect_pattern == 'area':
+                        noise_mask_feat1[0, 0, y1_feat:y2_feat, x1_feat:x2_feat] = 1.0
+                
+                batch_vis_info['noise_patches'].append(patch_info)
+                batch_vis_info['defect_patterns'].append(defect_pattern)
+                batch_vis_info['patch_coordinates'].append((y1, y2, x1, x2))
+        else:
+            noise_mask_feat1 = torch.zeros((1, 1, H // 4, W // 4), device=device)
+        
+        batch_vis_info['noised_image'] = noised_image[0].cpu().numpy()
+        batch_vis_info['noise_mask'] = noise_mask_feat1[0, 0].cpu().numpy()
+        
+        noised_images.append(noised_image)
+        noise_masks.append(noise_mask_feat1)
+        visualization_info.append(batch_vis_info)
+    
+    noised_image_batch = torch.cat(noised_images, dim=0)
+    noise_mask_batch = torch.cat(noise_masks, dim=0)
+
+    if visualize_noise and save_dir is not None:
+        visualize_noise_injection(visualization_info, save_dir)
+    
+    return noised_image_batch, noise_mask_batch
+
+if __name__ == '__main__':
+    main()
+    
