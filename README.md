@@ -28,3 +28,13 @@ periments on FSAD benchmarks including MVTec, MPDD,
 and ViSA. 
 
 <img width="1450" height="506" alt="image" src="https://github.com/user-attachments/assets/e322ecac-766b-4c99-a0be-d1bc09aa4a75" />
+
+# Get Started
+  1. Install Python 3.9.23 Pytorch 2.5.2
+
+  2. This experiment requires the data to be downloaded 
+    '''
+    MVTecAD: https://www.mvtec.com/company/research/datasets/mvtec-ad
+    ViSA: https://registry.opendata.aws/visa/
+    MPDD: https://github.com/stepanje/MPDD
+    '''
