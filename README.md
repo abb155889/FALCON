@@ -27,4 +27,4 @@ the-art methods, as demonstrated through comprehensive ex-
 periments on FSAD benchmarks including MVTec, MPDD,
 and ViSA. 
 
-[overview.pdf](https://github.com/user-attachments/files/21426274/overview.pdf)
+<img width="1450" height="506" alt="image" src="https://github.com/user-attachments/assets/e322ecac-766b-4c99-a0be-d1bc09aa4a75" />
