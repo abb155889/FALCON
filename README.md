@@ -30,10 +30,18 @@ and ViSA.
 <img width="1450" height="506" alt="image" src="https://github.com/user-attachments/assets/e322ecac-766b-4c99-a0be-d1bc09aa4a75" />
 
 # Get Started
-  1. Install Python 3.9.23 Pytorch 2.5.2
+  1. Install Python 3.9.23 Pytorch 2.0.0
 
   2. This experiment requires the data to be downloaded 
      
-    - [MVTecAD](https://www.mvtec.com/company/research/datasets/mvtec-ad)  
-    - [ViSA](https://registry.opendata.aws/visa/)  
-    - [MPDD](https://github.com/stepanje/MPDD)
+    [MVTecAD](https://www.mvtec.com/company/research/datasets/mvtec-ad)  
+    [ViSA](https://registry.opendata.aws/visa/)  
+    [MPDD](https://github.com/stepanje/MPDD)
+  
+  3. You can reproduce the experiment result by FALCON.py.
+
+# Main Result
+<img width="1054" height="572" alt="image" src="https://github.com/user-attachments/assets/331bfb82-3924-4f7b-bbfe-5b929253ed27" />
+
+    
+    
