@@ -26,3 +26,5 @@ improvement in image-level AUROC over previous state-of-
 the-art methods, as demonstrated through comprehensive ex-
 periments on FSAD benchmarks including MVTec, MPDD,
 and ViSA. 
+
+[overview.pdf](https://github.com/user-attachments/files/21426274/overview.pdf)
