@@ -33,8 +33,7 @@ and ViSA.
   1. Install Python 3.9.23 Pytorch 2.5.2
 
   2. This experiment requires the data to be downloaded 
-    '''
-    MVTecAD: https://www.mvtec.com/company/research/datasets/mvtec-ad
-    ViSA: https://registry.opendata.aws/visa/
-    MPDD: https://github.com/stepanje/MPDD
-    '''
+     
+    - [MVTecAD](https://www.mvtec.com/company/research/datasets/mvtec-ad)  
+    - [ViSA](https://registry.opendata.aws/visa/)  
+    - [MPDD](https://github.com/stepanje/MPDD)
