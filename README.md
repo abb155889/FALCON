@@ -41,7 +41,7 @@ and ViSA.
   3. You can reproduce the experiment result by FALCON.py.
 
 # Main Result
-<img width="1054" height="572" alt="image" src="https://github.com/user-attachments/assets/444d2f4b-56d1-46ee-963e-dee79138b8e6" />
+<img width="1054" height="572" alt="image" src="https://github.com/user-attachments/assets/ef93ce84-0c9b-412e-b93f-b80843c962f0" />
 
     
     
