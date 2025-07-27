@@ -535,7 +535,7 @@ def test_image_level_only(test_set, teacher, student, autoencoder, unified_decod
     image_metrics = calculate_metrics_fixed_threshold(y_true_image, y_score_image, fixed_threshold)
     
     return {   
-        'image_auroc': image_metrics['auroc'],   
+        'image_auc': image_metrics['auroc'],   
     }
 
 
