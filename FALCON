@@ -25,11 +25,11 @@ def get_argparse():
     parser.add_argument('-s', '--subdataset', default='all',
                         help='One of 15 sub-datasets of Mvtec AD or "all" for all categories')
     parser.add_argument('-o', '--output_dir', default='experiment_results/threshold')
-    parser.add_argument('-a', '--mvtec_ad_path', default='../mvtec_anomaly_detection')
-    parser.add_argument('-c', '--mpdd_path', default='./dataset/MPDD/MPDD')
-    parser.add_argument('-e', '--visa_path', default='./dataset/ViSA')
+    parser.add_argument('-a', '--mvtec_ad_path', default='./MVTEC')
+    parser.add_argument('-c', '--mpdd_path', default='.//MPDD')
+    parser.add_argument('-e', '--visa_path', default='.//ViSA')
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
-    parser.add_argument('--data_limit', type=int, default=5, help='Limit the number of training samples (e.g., 2, 4, 8)')
+    parser.add_argument('--data_limit', type=int, default=5, help='Limit the number of training samples (e.g., 2, 5, 10)')
     
     return parser.parse_args()
 
