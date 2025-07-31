@@ -24,7 +24,7 @@ def get_argparse():
                         choices=['mvtec_ad', 'mpdd', 'visa'])
     parser.add_argument('-s', '--subdataset', default='all',
                         help='One of 15 sub-datasets of Mvtec AD or "all" for all categories')
-    parser.add_argument('-o', '--output_dir', default='experiment_results/threshold')
+    parser.add_argument('-o', '--output_dir', default='./experiment_results')
     parser.add_argument('-a', '--mvtec_ad_path', default='./MVTEC')
     parser.add_argument('-c', '--mpdd_path', default='.//MPDD')
     parser.add_argument('-e', '--visa_path', default='.//ViSA')
