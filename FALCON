@@ -159,9 +159,9 @@ class Autoencoder(nn.Module):
         decoded = self.decoder(encoded) 
         return decoded
 
-class FusionCOnv(nn.Module): 
+class FusionConv(nn.Module): 
     def __init__(self, st_channels=256, ae_channels=256, out_channels=64):
-        super(FusionCOnv, self).__init__()
+        super(FusionConv, self).__init__()
         self.fusion = nn.Sequential(
             nn.Conv2d(st_channels * 2, st_channels * 1, kernel_size=3, padding=1),
             nn.BatchNorm2d(st_channels),
@@ -275,7 +275,7 @@ def train_single_category(category, config):
     teacher = ResNet18Teacher()
     student = Student(in_channels=out_channels, out_channels=out_channels*2)
     autoencoder = Autoencoder(in_channels=out_channels, out_channels=out_channels*2)
-    fusion_conv = FusionCOnv(st_channels=out_channels*2, ae_channels=out_channels*2, out_channels=out_channels*2)
+    fusion_conv = FusionConv(st_channels=out_channels*2, ae_channels=out_channels*2, out_channels=out_channels*2)
     detector = AnomalyDetector(decoder_channels=out_channels*2, teacher_channels=out_channels*2)
 
     teacher.eval()
