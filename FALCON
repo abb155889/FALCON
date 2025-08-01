@@ -25,13 +25,14 @@ def get_argparse():
     parser.add_argument('-s', '--subdataset', default='all',
                         help='One of 15 sub-datasets of Mvtec AD or "all" for all categories')
     parser.add_argument('-o', '--output_dir', default='./experiment_results')
-    parser.add_argument('-a', '--mvtec_ad_path', default='./MVTEC')
+    parser.add_argument('-a', '--mvtec_ad_path', default='./mvtec_anomaly_detection')
     parser.add_argument('-c', '--mpdd_path', default='.//MPDD')
     parser.add_argument('-e', '--visa_path', default='.//ViSA')
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
     parser.add_argument('--data_limit', type=int, default=5, help='Limit the number of training samples (e.g., 2, 5, 10)')
     
     return parser.parse_args()
+
 
 class ImageFolderWithoutTarget(ImageFolder):
     def __getitem__(self, index):
@@ -158,9 +159,9 @@ class Autoencoder(nn.Module):
         decoded = self.decoder(encoded) 
         return decoded
 
-class UnifiedDecoder(nn.Module): 
+class FusionCOnv(nn.Module): 
     def __init__(self, st_channels=256, ae_channels=256, out_channels=64):
-        super(UnifiedDecoder, self).__init__()
+        super(FusionCOnv, self).__init__()
         self.fusion = nn.Sequential(
             nn.Conv2d(st_channels * 2, st_channels * 1, kernel_size=3, padding=1),
             nn.BatchNorm2d(st_channels),
@@ -274,7 +275,7 @@ def train_single_category(category, config):
     teacher = ResNet18Teacher()
     student = Student(in_channels=out_channels, out_channels=out_channels*2)
     autoencoder = Autoencoder(in_channels=out_channels, out_channels=out_channels*2)
-    unified_decoder = UnifiedDecoder(st_channels=out_channels*2, ae_channels=out_channels*2, out_channels=out_channels*2)
+    fusion_conv = FusionCOnv(st_channels=out_channels*2, ae_channels=out_channels*2, out_channels=out_channels*2)
     detector = AnomalyDetector(decoder_channels=out_channels*2, teacher_channels=out_channels*2)
 
     teacher.eval()
@@ -283,21 +284,21 @@ def train_single_category(category, config):
         
     student.train()
     autoencoder.train()
-    unified_decoder.train()
+    fusion_conv.train()
     detector.train()
 
     if on_gpu:
         teacher.cuda()
         student.cuda()
         autoencoder.cuda()
-        unified_decoder.cuda()
+        fusion_conv.cuda()
         detector.cuda()
         
     main_optimizer = torch.optim.Adam(
         itertools.chain(
             student.parameters(),
             autoencoder.parameters(),
-            unified_decoder.parameters(),
+            fusion_conv.parameters(),
         ),
         lr=3e-4, weight_decay=1e-5, betas=(0.9, 0.99),
     )
@@ -318,7 +319,7 @@ def train_single_category(category, config):
     for epoch in range(config.epochs):
         student.train()
         autoencoder.train()
-        unified_decoder.train()
+        fusion_conv.train()
         detector.train()
         epoch_loss = 0.0
         epoch_st_loss = 0.0
@@ -335,7 +336,7 @@ def train_single_category(category, config):
             with torch.no_grad():
                 feat1, feat2, feat3 = teacher(image_st)
 
-            noised_image, noise_mask = adaptive_gradcam_noise(teacher, image_st, 0.05, 
+            noised_image, noise_mask = adaptive_gradcam_noise(teacher, image_st, 
                                         multiple_layers=['layer1', 'layer2', 'layer3'],
                                         ensemble_weights=[0.5, 0, 0.5],)
             
@@ -354,14 +355,14 @@ def train_single_category(category, config):
             ae_loss = F.mse_loss(ae_out, feat3)
             ae_loss += F.mse_loss(ae_out_clean, feat3)
 
-            decoder_out = unified_decoder(st_out, ae_out, feat1, feat2, feat3)
-            decoder_out_clean = unified_decoder(st_out_clean, ae_out_clean, feat1, feat2, feat3)
+            fusion_out_noise = fusion_conv(st_out, ae_out, feat1, feat2, feat3)
+            fusion_out_clean = fusion_conv(st_out_clean, ae_out_clean, feat1, feat2, feat3)
 
             noisy_target = F.interpolate(noise_mask.float(), size=feat3.shape[2:], mode='bilinear', align_corners=False)
             
 
-            recon_loss = reconstruction_loss(decoder_out_clean, feat3, torch.zeros_like(noise_mask))
-            recon_loss += reconstruction_loss(decoder_out, feat3, noise_mask)
+            recon_loss = reconstruction_loss(fusion_out_clean, feat3, torch.zeros_like(noise_mask))
+            recon_loss += reconstruction_loss(fusion_out_noise, feat3, noise_mask)
             
             total_loss = student_loss + ae_loss + recon_loss
             
@@ -371,10 +372,10 @@ def train_single_category(category, config):
             
             detector_optimizer.zero_grad()
             
-            decoder_out_clean = decoder_out_clean.detach()
+            fusion_out_clean = fusion_out_clean.detach()
 
-            anomaly_map_clean = detector(decoder_out_clean, feat3)
-            anomaly_map_noisy = detector(decoder_out.detach(), feat3_noisy)
+            anomaly_map_clean = detector(fusion_out_clean, feat3)
+            anomaly_map_noisy = detector(fusion_out_noise.detach(), feat3_noisy)
       
             clean_target = torch.zeros_like(anomaly_map_clean)
             noisy_target = F.interpolate(noise_mask.float(), size=anomaly_map_noisy.shape[2:], mode='bilinear', align_corners=False)
@@ -394,7 +395,7 @@ def train_single_category(category, config):
                 'Total': total_loss.item(),
                 'ST': student_loss.item(),
                 'AE': ae_loss.item(),
-                'Recon': recon_loss.item(),
+                'FC': recon_loss.item(),
                 'Det': detector_loss.item()
             })
         
@@ -404,16 +405,16 @@ def train_single_category(category, config):
     teacher.eval()
     student.eval()
     autoencoder.eval()
-    unified_decoder.eval()
+    fusion_conv.eval()
     detector.eval()
     
     final_metrics = test_image_level_only(
         test_set=test_set, teacher=teacher, student=student,
-        autoencoder=autoencoder, unified_decoder=unified_decoder, 
+        autoencoder=autoencoder, fusion_conv=fusion_conv, 
         pixel_detector=detector,
         desc='test ...', 
         fixed_threshold=0.1,
-        save_anomaly_map_dir=config.output_dir
+        save_anomaly_map_dir=test_output_dir
     )
 
     test_auc = final_metrics['image_auc']
@@ -425,7 +426,7 @@ def train_single_category(category, config):
         'teacher_state_dict': teacher.state_dict(),
         'student_state_dict': student.state_dict(),
         'autoencoder_state_dict': autoencoder.state_dict(),
-        'unified_decoder_state_dict': unified_decoder.state_dict(),
+        'fusion_conv_state_dict': fusion_conv.state_dict(),
         'pixel_detector_state_dict': detector.state_dict(),
         'final_metrics': final_metrics,
         'final_image_auc': test_auc,
@@ -443,28 +444,28 @@ def train_single_category(category, config):
     return result
 
 @torch.no_grad()
-def predict(image, teacher, student, autoencoder, unified_decoder, pixel_detector):
+def predict(image, teacher, student, autoencoder, fusion_conv, pixel_detector):
     feat1, feat2, feat3 = teacher(image) 
 
     st_out = student(feat2)    
     ae_out = autoencoder(feat2)
     
-    decoder_out = unified_decoder(st_out, ae_out, feat1, feat2, feat3)  
-    anomaly_map = pixel_detector(decoder_out, feat3)
+    fusion_out = fusion_conv(st_out, ae_out, feat1, feat2, feat3)  
+    anomaly_map = pixel_detector(fusion_out, feat3)
     
     map_st = torch.mean((feat3 - st_out)**2, dim=1, keepdim=True)  
     map_ae = torch.mean((feat3 - ae_out)**2, dim=1, keepdim=True)  
-    map_recon = torch.mean((feat3 - decoder_out)**2, dim=1, keepdim=True) 
+    map_fusion = torch.mean((feat3 - fusion_out)**2, dim=1, keepdim=True) 
     target_size = anomaly_map.shape[2:] 
     
     map_st_upsampled = F.interpolate(map_st, size=target_size, mode='bilinear', align_corners=False)
     map_ae_upsampled = F.interpolate(map_ae, size=target_size, mode='bilinear', align_corners=False)
 
-    map_combined = 0.3 * map_st_upsampled + 0.3 * map_ae_upsampled + 0.2 * anomaly_map + 0.2 * map_recon
+    map_combined = 0.3 * map_st_upsampled + 0.3 * map_ae_upsampled + 0.2 * anomaly_map + 0.2 * map_fusion
     
-    return map_combined, map_st_upsampled, map_ae_upsampled, map_recon
+    return map_combined, map_st_upsampled, map_ae_upsampled, map_fusion
 
-def test_image_level_only(test_set, teacher, student, autoencoder, unified_decoder, pixel_detector,
+def test_image_level_only(test_set, teacher, student, autoencoder, fusion_conv, pixel_detector,
                          desc='Running image-level inference', fixed_threshold=0.1,
                          save_anomaly_map_dir=None):
     y_true_image = []
@@ -479,9 +480,9 @@ def test_image_level_only(test_set, teacher, student, autoencoder, unified_decod
         if on_gpu:
             image_tensor = image_tensor.cuda()
             
-        map_combined, map_st, map_ae, map_recon = predict(
+        map_combined, map_st, map_ae, map_fusion = predict(
             image=image_tensor, teacher=teacher, student=student,
-            autoencoder=autoencoder, unified_decoder=unified_decoder,
+            autoencoder=autoencoder, fusion_conv=fusion_conv,
             pixel_detector=pixel_detector
         )
         map_combined = torch.nn.functional.pad(map_combined, (4, 4, 4, 4))
@@ -529,28 +530,11 @@ def test_image_level_only(test_set, teacher, student, autoencoder, unified_decod
             anomaly_map_uint8 = (norm_map * 255).astype(np.uint8)
             Image.fromarray(anomaly_map_uint8).save(save_path)
  
-     
-    fixed_threshold = 0.1
-
-    image_metrics = calculate_metrics_fixed_threshold(y_true_image, y_score_image, fixed_threshold)
-    
+    y_true = np.array(y_true_image)
+    y_score = np.array(y_score_image)
+    auroc = roc_auc_score(y_true, y_score) * 100 
     return {   
-        'image_auc': image_metrics['auroc'],   
-    }
-
-
-def calculate_metrics_fixed_threshold(y_true, y_score, fixed_threshold=0.1): # threshold 0.1로 고정 
-    y_true = np.array(y_true)
-    y_score = np.array(y_score)
-
-    y_pred_fixed = (y_score >= fixed_threshold).astype(int)
-    
-    auc = roc_auc_score(y_true, y_score) * 100
-    auroc = roc_auc_score(y_true, y_score) * 100
-
-
-    return {
-        'auroc': auroc,
+        'image_auc': auroc,   
     }
 
 def main():
@@ -759,7 +743,7 @@ class GradCAM:
         self.gradients = None
         self.activations = None
 
-def adaptive_gradcam_noise(teacher, image, noise_std=0.05, 
+def adaptive_gradcam_noise(teacher, image, 
                           multiple_layers=['layer1', 'layer2', 'layer3'], 
                           ensemble_weights=[0.5, 0, 0.5]):
     
