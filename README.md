@@ -40,7 +40,6 @@ and ViSA.
   
   3. You can reproduce the experiment result by FALCON.py.
 
-  4. Reproduce
      git clone https://github.com/abb155889/FALCON.git
      bash run_experiments.sh
 
