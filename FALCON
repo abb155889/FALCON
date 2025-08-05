@@ -6,6 +6,7 @@ import argparse
 import itertools
 import os
 import random
+from torch.utils.data import Dataset
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 import torch.nn.functional as F
@@ -25,8 +26,8 @@ def get_argparse():
     parser.add_argument('-s', '--subdataset', default='all',
                         help='One of 15 sub-datasets of Mvtec AD or "all" for all categories')
     parser.add_argument('-o', '--output_dir', default='./experiment_results')
-    parser.add_argument('-a', '--mvtec_ad_path', default='./mvtec_anomaly_detection')
-    parser.add_argument('-c', '--mpdd_path', default='.//MPDD')
+    parser.add_argument('-a', '--mvtec_ad_path', default='./MVTEC')
+    parser.add_argument('-c', '--mpdd_path', default='./MPDD')
     parser.add_argument('-e', '--visa_path', default='.//ViSA')
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
     parser.add_argument('--data_limit', type=int, default=5, help='Limit the number of training samples (e.g., 2, 5, 10)')
@@ -53,7 +54,7 @@ def InfiniteDataloader(loader):
         except StopIteration:
             iterator = iter(loader)
 
-seed = 1001
+seed = 616
 on_gpu = torch.cuda.is_available()
 image_size = 256
 out_channels = 128
@@ -244,13 +245,9 @@ def train_single_category(category, config):
             indices = torch.randperm(len(full_train_set))[:config.data_limit]
             full_train_set = torch.utils.data.Subset(full_train_set, indices)
             print(f"data limit: {len(full_train_set)}")
-
         test_set = ImageFolderWithPath(
             os.path.join(dataset_path, category, 'test'))
     
-        train_size = int(1 * len(full_train_set))
-        validation_size = len(full_train_set) - train_size
-        rng = torch.Generator().manual_seed(seed)
         train_set = full_train_set
 
     elif config.dataset == 'mpdd':
@@ -267,6 +264,23 @@ def train_single_category(category, config):
         test_set = ImageFolderWithPath(
             os.path.join(dataset_path, category, 'test'))
         
+        train_set = full_train_set
+    
+    elif config.dataset == 'visa':
+        full_train_set = ViSADataset(
+            root_dir=dataset_path,
+            category=category,
+            transform=transforms.Lambda(train_transform),
+            is_train=True,
+            data_limit=config.data_limit
+        )
+        test_set = ViSADataset(
+            root_dir=dataset_path,
+            category=category,
+            is_train=False,
+            return_path=True
+        )
+        print(f"data limit: {len(full_train_set)}")
         train_set = full_train_set
     
     train_loader = DataLoader(train_set, batch_size=1, shuffle=True,
@@ -945,6 +959,92 @@ def adaptive_gradcam_noise(teacher, image,
     noise_mask_batch = torch.cat(noise_masks, dim=0)
     
     return noised_image_batch, noise_mask_batch
+
+class ViSADataset(Dataset):
+    def __init__(self, root_dir, category, transform=None, is_train=True, return_path=False, data_limit=None):
+        self.root_dir = root_dir
+        self.category = category
+        self.transform = transform
+        self.is_train = is_train
+        self.return_path = return_path
+        self.data_limit = data_limit
+
+        self.image_paths = []
+        self.labels = []
+
+        self._load_data()
+
+    def _load_data(self):
+        if self.is_train:
+            normal_dir = os.path.join(self.root_dir, self.category, 'Data', 'Images', 'Normal')
+            if not os.path.isdir(normal_dir):
+                raise FileNotFoundError(f"Normal directory not found: {normal_dir}")
+            files = [f for f in os.listdir(normal_dir)
+                     if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+            if self.data_limit is not None and len(files) > self.data_limit:
+                random.seed(1001)
+                random.shuffle(files)
+                files = files[:self.data_limit]
+            paths = [os.path.join(normal_dir, f) for f in files]
+            self.image_paths.extend(paths)
+            self.labels.extend([0] * len(paths))
+        else:
+            normal_dir = os.path.join(self.root_dir, self.category, 'Data', 'Images', 'Normal')
+            anomaly_dir = os.path.join(self.root_dir, self.category, 'Data', 'Images', 'Anomaly')
+
+            if not os.path.isdir(normal_dir):
+                raise FileNotFoundError(f"Normal test directory not found: {normal_dir}")
+            if not os.path.isdir(anomaly_dir):
+                raise FileNotFoundError(f"Anomaly test directory not found: {anomaly_dir}")
+
+            normal_files = [f for f in os.listdir(normal_dir)
+                            if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+            random.seed(1001)
+            random.shuffle(normal_files)
+            normal_files = sorted(normal_files)[:100]
+            normal_paths = [os.path.join(normal_dir, f) for f in normal_files]
+            self.image_paths.extend(normal_paths)
+            self.labels.extend([0] * len(normal_paths))
+
+            anomaly_files = [f for f in os.listdir(anomaly_dir)
+                             if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+            anomaly_paths = [os.path.join(anomaly_dir, f) for f in anomaly_files]
+            self.image_paths.extend(anomaly_paths)
+            self.labels.extend([1] * len(anomaly_paths))
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert('RGB')
+        label = self.labels[idx]
+
+        if self.transform:
+            # transform(image) returns (image_st, image_ae)
+            image_st, image_ae = self.transform(image)
+
+        if self.is_train:
+            return image_st, image_ae
+        elif self.return_path:
+            return image_st, image_ae, label, img_path
+        else:
+            return image_st, image_ae, label
+                   
+def get_visa_mask_path_from_image_path(image_path):
+    parts = image_path.split(os.sep)
+    if 'Images' in parts and 'Anomaly' in parts:
+        mask_parts = []
+        for part in parts:
+            if part == 'Images':
+                mask_parts.append('Masks')
+            else:
+                mask_parts.append(part)
+        
+        return os.sep.join(mask_parts)
+    
+    return None
+
 
 if __name__ == '__main__':
     main()
