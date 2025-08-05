@@ -9,9 +9,9 @@
 DATASET="visa" # choices=['mvtec_ad', 'mpdd', 'visa'])
 SUBDATASET="all" # sub class
 OUTPUT_DIR="./experiment_results" # output dir
-MVTEC_AD_PATH="../mvtec_anomaly_detection" # mvtec dataset path 
-MPDD_PATH="../dataset/MPDD/MPDD" # mpdd dataset path 
-VISA_PATH="../dataset/ViSA" # visa datasaet path 
+MVTEC_AD_PATH="./MVTecAD" # mvtec_ad dataset path 
+MPDD_PATH="./MPDD" # mpdd dataset path 
+VISA_PATH="./ViSA" # visa datasaet path 
 EPOCHS=100 # epochs
 DATA_LIMIT=5 # few shot setting choices=[2, 5, 10]
 
