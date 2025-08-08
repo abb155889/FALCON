@@ -42,6 +42,7 @@ and ViSA.
 
     git clone https://github.com/abb155889/FALCON.git
     cd FALCON
+    # Edit dataset paths in run_experiments.sh before running
     bash run_experiments.sh
 
 
