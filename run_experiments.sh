@@ -43,7 +43,6 @@ done
 # Ensure output directory exists
 mkdir -p "${OUTPUT_DIR}"
 
-# Run the Python script (replace `script.py` with your filename)
 python falcon.py \
   -d "${DATASET}" \
   -s "${SUBDATASET}" \
