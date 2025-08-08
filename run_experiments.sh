@@ -6,8 +6,8 @@
 #                           [--epochs epochs] [--data_limit limit]
 
 # Default arguments
-DATASET="visa" # choices=['mvtec_ad', 'mpdd', 'visa'])
-SUBDATASET="all" # sub class
+DATASET="mvtec_ad" # choices=['mvtec_ad', 'mpdd', 'visa'])
+SUBDATASET="bottle" # sub class
 OUTPUT_DIR="./experiment_results" # output dir
 MVTEC_AD_PATH="./MVTecAD" # mvtec_ad dataset path 
 MPDD_PATH="./MPDD" # mpdd dataset path 
