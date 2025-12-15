@@ -59,5 +59,13 @@ and ViSA.
   <img src="https://github.com/user-attachments/assets/9f75096a-81c4-472b-b9e6-31bc9ecc3a6e" width="49%" />
 </p>
 
+# 비교군 실험 시 유의할 점
+ 1. Falcon은 validation을 사용하지 않고, train image 만을 사용합니다
+ 2. 비교군 중 validation set이 있는 경우 (EfficientAD, FewSOME)에는
+    1) EfficientAD: Train set 일부를 validation set으로 사용 or train set의 10~20%에 해당되는 추가 data를 validation set으로 사용
+    2) FewSOME: Test set을 이용한 early stopping 옵션 해제
+    를 통해 공정한 실험 조건을 맞추어야 합니다.
+ 3. 모든 백본은 ResNet18로 통일합니다.
+    1) 자체 백본을 사용하는 EfficientAD(4개의 layter)의 경우, ResNet18의 1,2,3, 4 layer를 사용합니다.  
     
     
