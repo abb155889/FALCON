@@ -1,4 +1,4 @@
-#논문 주요 Figure 생성 코드
+# 논문 주요 Figure 생성 코드
 해당 디렉토리에는 논문에 사용된 주요 Figure를 재현하기 위한 코드가 포함되어 있습니다.
 
 ## Noise Injection Visualization
@@ -33,6 +33,9 @@
 
 - 실행 방법
   1. Google Research 저장소를 git clone
-  2. 해당 저장소를 본 프로젝트와 **동일한 root 디렉터리**에 위치
+      ```bash
+      git clone https://github.com/google-research/google-research.git
+      ```
+  2. `google-research` 저장소를 동일한 root 디렉터리에 위치
   3. `margin_on_training.py` 실행
   4. 실행 후 `train_output_dir`에 생성된 CSV 파일을 `make_plot.py`에 입력하여 plot 생성
