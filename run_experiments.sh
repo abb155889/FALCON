@@ -43,7 +43,7 @@ done
 # Ensure output directory exists
 mkdir -p "${OUTPUT_DIR}"
 
-python falcon.py \
+python falcon_infer.py \
   -d "${DATASET}" \
   -s "${SUBDATASET}" \
   -o "${OUTPUT_DIR}" \
