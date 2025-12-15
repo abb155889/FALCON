@@ -66,7 +66,7 @@ and ViSA.
 - FALCON은 validation set을 사용하지 않습니다.
 - 학습에는 train image만 사용합니다.
 
-## 2. Validation Set이 존재하는 비교 방법 설정
+### 2. Validation Set이 존재하는 비교 방법 설정
 Validation set을 사용하는 비교 방법의 경우, FALCON과의 공정한 비교를 위해 다음과 같이 설정합니다.
 
 - EfficientAD
@@ -77,7 +77,7 @@ Validation set을 사용하는 비교 방법의 경우, FALCON과의 공정한 �
 - FewSOME
   - Test set을 이용한 early stopping 옵션을 비활성화 합니다.
 
-## 3. Backbone 구조 통일
+### 3. Backbone 구조 통일
 - 모든 방법은 ResNet-18을 backbone으로 사용합니다.
 - 자체 backbone 구조를 사용하는 EfficientAD의 경우:
   - ResNet-18의 1, 2, 3, 4번 layer를 사용하여 4-layer 구조와 대응시킵니다.
