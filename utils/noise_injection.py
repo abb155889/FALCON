@@ -123,7 +123,9 @@ class GradCAM:
 
 def adaptive_gradcam_noise(teacher, image, 
                           multiple_layers=['layer1', 'layer2', 'layer3'], 
-                          ensemble_weights=[0.5, 0, 0.5]):
+                          ensemble_weights=[0.5, 0, 0.5],
+                          visualize=False, save_dir=None, ###노이즈 주입 이미지 시각화 옵션, 기본 설정은 꺼둠 
+                          ):
     
     B, C, H, W = image.shape
     device = image.device
@@ -153,7 +155,10 @@ def adaptive_gradcam_noise(teacher, image,
     
     noised_images = []
     noise_masks = []
-
+     
+    if visualize and save_dir is not None:
+        visualization_info = []
+    
     for b in range(B):
         single_image = image[b:b+1]
         cam_np = ensemble_cam[b].detach().cpu().numpy() 
@@ -170,7 +175,16 @@ def adaptive_gradcam_noise(teacher, image,
  
         noised_image = single_image.clone()
         obj_pixels = np.where(object_mask > 0.7)
-        
+    
+        if visualize and save_dir is not None:
+            batch_vis_info = {
+                'original_image': single_image[0].cpu().numpy(),
+                'cam': cam_np,
+                'object_mask': object_mask,
+                'noise_patches': [],
+                'defect_patterns': [],
+                'patch_coordinates': []
+            }        
         if len(obj_pixels[0]) > 0:
             object_area = np.sum(object_mask)
             num_patches = max(1, min(3, int(object_area / (H * W) * 10)))  
@@ -313,8 +327,18 @@ def adaptive_gradcam_noise(teacher, image,
                     
                     elif defect_pattern == 'area':
                         noise_mask_feat1[0, 0, y1_feat:y2_feat, x1_feat:x2_feat] = 1.0
+                
+                if visualize:
+                    batch_vis_info['noise_patches'].append(patch_info)
+                    batch_vis_info['defect_patterns'].append(defect_pattern)
+                    batch_vis_info['patch_coordinates'].append((y1, y2, x1, x2))
         else:
             noise_mask_feat1 = torch.zeros((1, 1, H // 4, W // 4), device=device)
+        
+        if visualize:     
+            batch_vis_info['noised_image'] = noised_image[0].cpu().numpy()
+            batch_vis_info['noise_mask'] = noise_mask_feat1[0, 0].cpu().numpy()
+            visualization_info.append(batch_vis_info)
         
         noised_images.append(noised_image)
         noise_masks.append(noise_mask_feat1)
@@ -322,4 +346,225 @@ def adaptive_gradcam_noise(teacher, image,
     noised_image_batch = torch.cat(noised_images, dim=0)
     noise_mask_batch = torch.cat(noise_masks, dim=0)
     
+    if visualize and save_dir is not None:
+        visualize_noise_injection(visualization_info, save_dir)
+    
     return noised_image_batch, noise_mask_batch
+
+def visualize_noise_injection(visualization_info, save_dir):
+
+    #노이즈 주입 과정 시각화하는 함수
+    
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    
+    os.makedirs(save_dir, exist_ok=True)
+    
+    for batch_idx, vis_info in enumerate(visualization_info):
+        # 이미지 정규화 함수
+        def normalize_image(img):
+            img_min = img.min()
+            img_max = img.max()
+            if img_max > img_min:
+                return (img - img_min) / (img_max - img_min)
+            return img
+        
+        # 원본 이미지
+        original_img = normalize_image(vis_info['original_image'].transpose(1, 2, 0))
+        
+        # 노이즈된 이미지
+        noised_img = normalize_image(vis_info['noised_image'].transpose(1, 2, 0))
+        
+        # CAM
+        cam_img = vis_info['cam']
+        
+        # 객체 마스크
+        object_mask = vis_info['object_mask']
+        
+        # 노이즈 마스크
+        noise_mask = vis_info['noise_mask']
+        
+        # 시각화 생성 (더 큰 크기로 변경)
+        fig, axes = plt.subplots(2, 4, figsize=(24, 12))
+        fig.suptitle(f'Noise Injection Visualization - Batch {batch_idx}', fontsize=16)
+        
+        # 1. 원본 이미지
+        axes[0, 0].imshow(original_img)
+        axes[0, 0].set_title('Original Image')
+        axes[0, 0].axis('off')
+        
+        # 2. CAM
+        axes[0, 1].imshow(cam_img, cmap='jet')
+        axes[0, 1].set_title('Grad-CAM++')
+        axes[0, 1].axis('off')
+        
+        # 3. 객체 마스크
+        axes[0, 2].imshow(object_mask, cmap='gray')
+        axes[0, 2].set_title('Object Mask')
+        axes[0, 2].axis('off')
+        
+        # 4. 노이즈된 이미지
+        axes[1, 0].imshow(noised_img)
+        axes[1, 0].set_title('Noised Image')
+        axes[1, 0].axis('off')
+        
+        # 5. 노이즈 마스크
+        axes[1, 1].imshow(noise_mask, cmap='hot')
+        axes[1, 1].set_title('Noise Mask (Feature Level)')
+        axes[1, 1].axis('off')
+        
+        # 6. Object Mask 오버랩 시각화
+        axes[1, 2].imshow(noised_img)
+        axes[1, 2].imshow(object_mask, alpha=0.3, cmap='Reds')
+        axes[1, 2].set_title('Noised Image + Object Mask Overlay')
+        axes[1, 2].axis('off')
+        
+        # 노이즈 패치들을 사각형으로 표시
+        for patch_info in vis_info['noise_patches']:
+            y1, y2, x1, x2 = patch_info['coordinates']
+            pattern = patch_info['defect_pattern']
+            
+            # 패턴에 따른 색상 설정
+            if pattern == 'spot':
+                color = 'red'
+                linewidth = 3
+            elif pattern == 'line':
+                color = 'blue'
+                linewidth = 3
+            elif pattern == 'area':
+                color = 'green'
+                linewidth = 3
+            elif pattern == 'object_replacement':
+                color = 'orange'
+                linewidth = 4
+            elif pattern == 'shape_distortion':
+                color = 'purple'
+                linewidth = 3
+            else:
+                color = 'yellow'
+                linewidth = 3
+            
+            # 경계 박스 표시 (투명한 채우기)
+            rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, 
+                                   linewidth=linewidth, edgecolor=color, facecolor='none')
+            axes[1, 2].add_patch(rect)
+            
+            # 패치 정보 텍스트 (박스 바깥에 표시)
+            center_y, center_x = patch_info['center']
+            # 박스 아래쪽에 텍스트 배치
+            text_y = y2 + 5  # 박스 아래쪽에 약간의 간격
+            if text_y >= noised_img.shape[0]:  # 이미지 경계를 벗어나면 위쪽에 배치
+                text_y = y1 - 5
+            
+            axes[1, 2].text(center_x, text_y, pattern, 
+                           color=color, fontsize=8, ha='center', va='center',
+                           bbox=dict(boxstyle="round,pad=0.2", facecolor='white', alpha=0.9, edgecolor=color))
+        
+        # 노이즈 패치 정보 텍스트
+        info_text = f"Total patches: {len(vis_info['noise_patches'])}\n"
+        for i, patch_info in enumerate(vis_info['noise_patches']):
+            pattern = patch_info['defect_pattern']
+            size = patch_info['patch_size']
+            info_text += f"Patch {i+1}: {pattern} (size: {size})\n"
+        
+        # 정보 텍스트를 별도 창에 표시
+        fig_info, ax_info = plt.subplots(figsize=(8, 6))
+        ax_info.text(0.1, 0.9, info_text, transform=ax_info.transAxes, 
+                    fontsize=10, verticalalignment='top',
+                    bbox=dict(boxstyle="round,pad=0.5", facecolor='lightblue', alpha=0.8))
+        ax_info.set_xlim(0, 1)
+        ax_info.set_ylim(0, 1)
+        ax_info.axis('off')
+        ax_info.set_title('Noise Patch Information')
+        
+        # 저장
+        plt.savefig(os.path.join(save_dir, f'noise_visualization_batch_{batch_idx}.png'), 
+                   dpi=300, bbox_inches='tight')
+        fig_info.savefig(os.path.join(save_dir, f'noise_info_batch_{batch_idx}.png'), 
+                        dpi=300, bbox_inches='tight')
+        
+        # 별도의 오버랩 시각화 생성
+        fig_overlap, ax_overlap = plt.subplots(figsize=(12, 8))
+        ax_overlap.imshow(noised_img)
+        ax_overlap.set_title(f'Noised Image with Noise Patches Boundaries - Batch {batch_idx}', fontsize=14)
+        ax_overlap.axis('off')
+        
+        # 노이즈 패치들을 오버랩
+        for patch_info in vis_info['noise_patches']:
+            y1, y2, x1, x2 = patch_info['coordinates']
+            pattern = patch_info['defect_pattern']
+            
+            # 패턴에 따른 색상 설정
+            if pattern == 'spot':
+                color = 'red'
+                linewidth = 3
+            elif pattern == 'line':
+                color = 'blue'
+                linewidth = 3
+            elif pattern == 'area':
+                color = 'green'
+                linewidth = 3
+            elif pattern == 'object_replacement':
+                color = 'orange'
+                linewidth = 4
+            elif pattern == 'shape_distortion':
+                color = 'purple'
+                linewidth = 3
+            else:
+                color = 'yellow'
+                linewidth = 3
+            
+            # 경계 박스 표시 (투명한 채우기)
+            rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, 
+                                   linewidth=linewidth, edgecolor=color, facecolor='none')
+            ax_overlap.add_patch(rect)
+            
+            # 패치 정보 텍스트 (박스 바깥에 표시)
+            center_y, center_x = patch_info['center']
+            # 박스 아래쪽에 텍스트 배치
+            text_y = y2 + 8  # 박스 아래쪽에 약간의 간격
+            if text_y >= noised_img.shape[0]:  # 이미지 경계를 벗어나면 위쪽에 배치
+                text_y = y1 - 8
+            
+            ax_overlap.text(center_x, text_y, pattern, 
+                           color=color, fontsize=10, ha='center', va='center',
+                           bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.9, edgecolor=color))
+        
+        # 범례 추가
+        legend_elements = [
+            patches.Patch(color='red', alpha=0.3, label='Spot'),
+            patches.Patch(color='blue', alpha=0.4, label='Line'),
+            patches.Patch(color='green', alpha=0.3, label='Area'),
+            patches.Patch(color='orange', alpha=0.5, label='Object Replacement'),
+            patches.Patch(color='purple', alpha=0.4, label='Shape Distortion')
+        ]
+        ax_overlap.legend(handles=legend_elements, loc='upper right', fontsize=10)
+        
+        # 오버랩 시각화 저장
+        plt.savefig(os.path.join(save_dir, f'noise_overlap_batch_{batch_idx}.png'), 
+                   dpi=300, bbox_inches='tight')
+        
+        # 7. Object Mask 품질 분석 (4번째 열)
+        axes[0, 3].imshow(original_img)
+        axes[0, 3].imshow(object_mask, alpha=0.4, cmap='Reds')
+        axes[0, 3].set_title('Original + Object Mask')
+        axes[0, 3].axis('off')
+        
+        # 8. Object Mask 통계 정보
+        object_area_ratio = np.sum(object_mask) / (object_mask.shape[0] * object_mask.shape[1])
+        axes[1, 3].text(0.1, 0.8, f'Object Area Ratio: {object_area_ratio:.3f}', 
+                        transform=axes[1, 3].transAxes, fontsize=12)
+        axes[1, 3].text(0.1, 0.6, f'Object Pixels: {np.sum(object_mask)}', 
+                        transform=axes[1, 3].transAxes, fontsize=12)
+        axes[1, 3].text(0.1, 0.4, f'Total Pixels: {object_mask.size}', 
+                        transform=axes[1, 3].transAxes, fontsize=12)
+        axes[1, 3].text(0.1, 0.2, f'Mask Coverage: {len(vis_info["noise_patches"])} patches', 
+                        transform=axes[1, 3].transAxes, fontsize=12)
+        axes[1, 3].set_title('Object Mask Statistics')
+        axes[1, 3].axis('off')
+        
+        plt.close(fig)
+        plt.close(fig_info)
+        plt.close(fig_overlap)
+        
+        print(f"Noise visualization saved to {save_dir}")
