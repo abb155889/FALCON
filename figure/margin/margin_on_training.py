@@ -1,3 +1,8 @@
+##########################################################################################################################################################
+# training 중 test set에 대한 margin(모델의 확신도)를 측정하는 코드입니다. (test set을 해당 epoch에서의 margin 측정에만 이용하기 때문에, 성능엔 영향 없습니다.)
+# 훈련 시 측정을 위해 100epoch을 수행하며, margin을 기록하고, csv 파일로 저장합니다. 이때 저장된 csv 파일은 make_margin_plot.py에 연결해주면 됩니다.
+##########################################################################################################################################################
+
 import numpy as np
 import tifffile
 import torch
@@ -745,7 +750,7 @@ def test_image_level_only(test_set, teacher, student, autoencoder, unified_decod
     pure_inference_time = (pure_inference_end - pure_inference_start)
     pure_inference_time_per_image = pure_inference_time * 1000 / len(test_set)
     
-    print(f"🚀 Pure inference time: {pure_inference_time:.2f}s ({pure_inference_time_per_image:.2f}ms per image)")
+    print(f" Pure inference time: {pure_inference_time:.2f}s ({pure_inference_time_per_image:.2f}ms per image)")
 
     if save_anomaly_map_dir is not None:
         save_start_time = time.perf_counter()

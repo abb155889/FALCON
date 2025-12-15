@@ -1,3 +1,12 @@
+###########################################################################################################################
+# 이미지에 noise를 주입한 버전을 시각화하는 코드입니다. 
+# <hyperparams>
+# output_dir: 이미지 저장 경로  
+# data_limit: 몇개를 저장할지 
+# visualize_noise_image: 저장 옵션 (True로 설정해야 저장됨)
+# 노이즈는 매번 랜덤한 위치에 저장됩니다. 한 이미지에 대해 다양한 노이즈 주입 버전을 보고 싶다면, epochs을 늘려보세요.
+###########################################################################################################################
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -14,6 +23,7 @@ import json
 from utils.data import ImageFolderWithoutTarget, ImageFolderWithPath, InfiniteDataloader, set_global_seed, ViSADataset, get_visa_mask_path_from_image_path, MVTEC_AD_CATEGORIES, MPDD_CATEGORIES, VISA_CATEGORIES
 from utils.falcon_arch import ResNet18Teacher
 from utils.noise_injection import GradCAM, adaptive_gradcam_noise
+
 def get_argparse():
     parser = argparse.ArgumentParser()
     parser.add_argument('-d', '--dataset', default='mvtec_ad',
@@ -24,6 +34,8 @@ def get_argparse():
     parser.add_argument('-a', '--mvtec_ad_path', default='./MVTEC')
     parser.add_argument('-c', '--mpdd_path', default='./MPDD')
     parser.add_argument('-e', '--visa_path', default='.//ViSA')
+    parser.add_argument('--epochs', type=int, default=1, help='Number of training epochs')
+
     parser.add_argument('--data_limit', type=int, default=5, help='Number of noise injected image')
     parser.add_argument('--visualize_noise_image', type=bool, default=True, help='Make noise injection image')
     
@@ -112,8 +124,8 @@ def train_single_category(category, config):
         param.requires_grad = False
     if on_gpu:
         teacher.cuda()
-    for epoch in range(config.data_limit):
-        tqdm_obj = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.data_limit}")
+    for epoch in range(config.epochs):
+        tqdm_obj = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs}")
         for batch_idx, (image_st, image_ae) in enumerate(tqdm_obj):
             if on_gpu:
                 image_st = image_st.cuda()    

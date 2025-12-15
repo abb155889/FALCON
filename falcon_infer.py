@@ -14,6 +14,7 @@ import json
 from utils.data import ImageFolderWithoutTarget, ImageFolderWithPath, InfiniteDataloader, set_global_seed, ViSADataset, get_visa_mask_path_from_image_path, MVTEC_AD_CATEGORIES, MPDD_CATEGORIES, VISA_CATEGORIES
 from utils.falcon_arch import ResNet18Teacher, Student, Autoencoder, FusionConv, AnomalyDetector
 from utils.noise_injection import GradCAM, adaptive_gradcam_noise
+
 def get_argparse():
     parser = argparse.ArgumentParser()
     parser.add_argument('-d', '--dataset', default='mvtec_ad',
@@ -53,19 +54,22 @@ transform_ae = transforms.Compose([
 def train_transform(image):  
     return default_transform(image), default_transform(transform_ae(image))
 
+
+# Weighted FusuionConv loss: 노이즈 영역에 가중치를 주어 loss에 포함합니다.
 def reconstruction_loss(decoder_out, teacher_feat1, noise_mask):
     if noise_mask.shape[2:] != decoder_out.shape[2:]:
         noise_mask = F.interpolate(noise_mask.float(), size=decoder_out.shape[2:], mode='bilinear', align_corners=False)
     reconstruction_error = F.mse_loss(decoder_out, teacher_feat1, reduction='none')
     normal_mask = 1.0 - noise_mask
-    weighted_error = reconstruction_error * (normal_mask + 2.0 * noise_mask)
+    weighted_error = reconstruction_error * (normal_mask + 2.0 * noise_mask) # 현재 가중치 2로 설정됨
     return torch.mean(weighted_error)
 
-
+# 학습 함수 
 def train_single_category(category, config):
     print(f"\n Training {category}")
     set_global_seed(seed)
     
+    # 데이터셋 설정 
     if config.dataset == 'mvtec_ad':
         dataset_path = config.mvtec_ad_path
     elif config.dataset == 'mvtec_loco':
@@ -133,17 +137,20 @@ def train_single_category(category, config):
     
     train_loader = DataLoader(train_set, batch_size=1, shuffle=True,
                               num_workers=1, pin_memory=True)
-
+    
+    # 모델 구성 (모델의 자세한 구현은 utils/falcon_arch.py 참조)
     teacher = ResNet18Teacher()
     student = Student(in_channels=out_channels, out_channels=out_channels*2)
     autoencoder = Autoencoder(in_channels=out_channels, out_channels=out_channels*2)
     fusion_conv = FusionConv(st_channels=out_channels*2, ae_channels=out_channels*2, out_channels=out_channels*2)
     detector = AnomalyDetector(decoder_channels=out_channels*2, teacher_channels=out_channels*2)
 
+    # teacher 모델은 eval 모드로 설정하여, 학습에서 제외
     teacher.eval()
     for param in teacher.parameters():
         param.requires_grad = False
-        
+    
+    # student, autoencoder, fusion_conv, detector는 모두 학습 대상임 
     student.train()
     autoencoder.train()
     fusion_conv.train()
@@ -155,7 +162,8 @@ def train_single_category(category, config):
         autoencoder.cuda()
         fusion_conv.cuda()
         detector.cuda()
-        
+    
+    # student, autoencoder, fusion_conv // detector 로 나누어서 2-stage 훈련 방식임 => 2개의 optimizer와 scheduler를 각각 구현 
     main_optimizer = torch.optim.Adam(
         itertools.chain(
             student.parameters(),
@@ -178,6 +186,7 @@ def train_single_category(category, config):
         detector_optimizer, step_size=max(1, config.epochs//2), gamma=0.5
     )
 
+    # 학습 시작 
     for epoch in range(config.epochs):
         student.train()
         autoencoder.train()
@@ -192,55 +201,65 @@ def train_single_category(category, config):
         
         for batch_idx, (image_st, image_ae) in enumerate(tqdm_obj):
             if on_gpu:
+                # image_st, image_ae는 하나의 이미지를 다른 transform 함수에 넣은 것 
                 image_st = image_st.cuda()
                 image_ae = image_ae.cuda()
+                
+            #########################################################################################################################     
+            ### Stage 1: Student, Autoencoder, Fusion conv (훈련은 2-stage로 진행됨)
+            #########################################################################################################################  
             
-            with torch.no_grad():
-                feat1, feat2, feat3 = teacher(image_st)
-
+            # gradcam을 이용하여 이미지에 노이즈를 주입 => 가상의 결함 이미지 생성 (자세한 구현은 utils/noise_injection.py 참조)
             noised_image, noise_mask = adaptive_gradcam_noise(teacher, image_st, 
                                         multiple_layers=['layer1', 'layer2', 'layer3'],
-                                        ensemble_weights=[0.5, 0, 0.5],)
-            
+                                        ensemble_weights=[0.5, 0, 0.5],) # 각 layer에서 cam을 뽑고 합칠 때 사용하는 가중치 (합이 1)
             with torch.no_grad():
-                feat1_noisy, feat2_noisy, feat3_noisy = teacher(noised_image)
+                feat1, feat2, feat3 = teacher(image_st) # 정상에 대한 teacher의 1, 2, 3 layer 출력을 뽑음 
+                feat1_noisy, feat2_noisy, feat3_noisy = teacher(noised_image) # 이상에 대한 teacher의 1, 2, 3 layer 출력을 뽑음 
             
-            st_out_clean = student(feat2)
-            st_out = student(feat2_noisy)
+            # stduent, autoencoder의 구조는 teacher 2nd output size => teacher 3rd output size로 작아지는 형태 
+            st_out_clean = student(feat2) # 정상 teacher 2nd feature(input)에 대한 student의 output 
+            st_out_noisy = student(feat2_noisy) # 이상 teacher 2nd feature(input)에 대한 student의 output 
             
-            ae_out_clean = autoencoder(feat2)
-            ae_out = autoencoder(feat2_noisy)
+            ae_out_clean = autoencoder(feat2) # 정상 teacher 2nd feature(input)에 대한 autoencoder의 output 
+            ae_out_noisy = autoencoder(feat2_noisy) # 이상 teacher 2nd feature(input)에 대한 autoencoder의 output 
             
-            student_loss = F.mse_loss(st_out, feat3)
-            student_loss += F.mse_loss(st_out_clean, feat3)
-
-            ae_loss = F.mse_loss(ae_out, feat3)
-            ae_loss += F.mse_loss(ae_out_clean, feat3)
-
-            fusion_out_noise = fusion_conv(st_out, ae_out, feat1, feat2, feat3)
-            fusion_out_clean = fusion_conv(st_out_clean, ae_out_clean, feat1, feat2, feat3)
-
-            noisy_target = F.interpolate(noise_mask.float(), size=feat3.shape[2:], mode='bilinear', align_corners=False)
+            # Goal: student, autoencoder는 (정상/이상)을 모두 => (정상)으로 재구성함
+            # 따라서 이상에 대해서 st, auto는 (정상), teacher는 (이상) 특징을 뽑아내고, 이 차이를 계산하여 결함 영역을 판단 
             
+            student_loss = F.mse_loss(st_out_noisy, feat3) # student가 재구성한 (이상) - 실제 teacher가 뽑은 (정상) 
+            student_loss += F.mse_loss(st_out_clean, feat3) # student가 뽑은 (정상) - 실제 teacher가 뽑은 (정상)
 
+            ae_loss = F.mse_loss(ae_out_noisy, feat3) # autoencoder가 재구성한 (이상) - 실제 teacher가 뽑은 (정상) 
+            ae_loss += F.mse_loss(ae_out_clean, feat3) # autoencoder가 뽑은 (정상) - 실제 teacher가 뽑은 (정상)
+
+            # fusion conv는 st, ae의 출력을 받아, 다시 한 번 (정상)으로의 재구성을 수행 
+            fusion_out_noise = fusion_conv(st_out_noisy, ae_out_noisy, feat1, feat2, feat3) # (이상) => (정상)으로 
+            fusion_out_clean = fusion_conv(st_out_clean, ae_out_clean, feat1, feat2, feat3) # (정상) => (정상)으로 
+
+            noisy_target = F.interpolate(noise_mask.float(), size=feat3.shape[2:], mode='bilinear', align_corners=False) 
+            
+            # fusion conv가 (정상)으로 재구성하지 못한 영역에 가중치를 더하는 loss 설계 
             recon_loss = reconstruction_loss(fusion_out_clean, feat3, torch.zeros_like(noise_mask))
             recon_loss += reconstruction_loss(fusion_out_noise, feat3, noise_mask)
             
+            # st, ae, fusion cov 끼리 훈련 시킴
             total_loss = student_loss + ae_loss + recon_loss
             
             main_optimizer.zero_grad()
             total_loss.backward()
             main_optimizer.step()
             
+            #########################################################################################################################     
+            ### Stage 2: Detector (fusion conv의 출력(정상으로 재구성)과 teacher의 출력(이상)을 비교하여 결함 영역을 찾아내는 역할)
+            #########################################################################################################################  
             detector_optimizer.zero_grad()
             
-            fusion_out_clean = fusion_out_clean.detach()
-
-            anomaly_map_clean = detector(fusion_out_clean, feat3)
-            anomaly_map_noisy = detector(fusion_out_noise.detach(), feat3_noisy)
+            anomaly_map_clean = detector(fusion_out_clean.detach(), feat3)  # (정상)에 대한 fusion conv 출력
+            anomaly_map_noisy = detector(fusion_out_noise.detach(), feat3_noisy) # (이상)에 대한 fusion conv 출력
       
-            clean_target = torch.zeros_like(anomaly_map_clean)
-            noisy_target = F.interpolate(noise_mask.float(), size=anomaly_map_noisy.shape[2:], mode='bilinear', align_corners=False)
+            clean_target = torch.zeros_like(anomaly_map_clean) # (정상)에 대해서는 detector가 모두 0이라고 찾아야함 (이상이라고 생각하는 부분이 없어야함)
+            noisy_target = F.interpolate(noise_mask.float(), size=anomaly_map_noisy.shape[2:], mode='bilinear', align_corners=False) # (이상)에 대해서는 detector가 노이즈 주입된 영역을 찾아야함
             
             detector_loss = F.binary_cross_entropy(anomaly_map_clean, clean_target) + \
                             F.binary_cross_entropy(anomaly_map_noisy, noisy_target)
@@ -264,6 +283,7 @@ def train_single_category(category, config):
         main_scheduler.step()
         detector_scheduler.step()
         
+    # 훈련 종료 시 평가 
     teacher.eval()
     student.eval()
     autoencoder.eval()
@@ -308,22 +328,22 @@ def train_single_category(category, config):
 @torch.no_grad()
 def predict(image, teacher, student, autoencoder, fusion_conv, pixel_detector):
     feat1, feat2, feat3 = teacher(image) 
-
+    # st, auto, fc 와 teacher의 차이, detector의 예측을 모두 반영 
     st_out = student(feat2)    
     ae_out = autoencoder(feat2)
     
     fusion_out = fusion_conv(st_out, ae_out, feat1, feat2, feat3)  
-    anomaly_map = pixel_detector(fusion_out, feat3)
+    anomaly_map = pixel_detector(fusion_out, feat3) # detector 
     
-    map_st = torch.mean((feat3 - st_out)**2, dim=1, keepdim=True)  
-    map_ae = torch.mean((feat3 - ae_out)**2, dim=1, keepdim=True)  
-    map_fusion = torch.mean((feat3 - fusion_out)**2, dim=1, keepdim=True) 
+    map_st = torch.mean((feat3 - st_out)**2, dim=1, keepdim=True) # teacher - st
+    map_ae = torch.mean((feat3 - ae_out)**2, dim=1, keepdim=True)  # teacher - ae
+    map_fusion = torch.mean((feat3 - fusion_out)**2, dim=1, keepdim=True)  # teacher - fc 
     target_size = anomaly_map.shape[2:] 
     
-    map_st_upsampled = F.interpolate(map_st, size=target_size, mode='bilinear', align_corners=False)
-    map_ae_upsampled = F.interpolate(map_ae, size=target_size, mode='bilinear', align_corners=False)
+    map_st_upsampled = F.interpolate(map_st, size=target_size, mode='bilinear', align_corners=False) # 사이즈 맞춰줌 
+    map_ae_upsampled = F.interpolate(map_ae, size=target_size, mode='bilinear', align_corners=False) # 사이즈 맞춰줌 
 
-    map_combined = 0.3 * map_st_upsampled + 0.3 * map_ae_upsampled + 0.2 * anomaly_map + 0.2 * map_fusion
+    map_combined = 0.3 * map_st_upsampled + 0.3 * map_ae_upsampled + 0.2 * anomaly_map + 0.2 * map_fusion # 가중합 
     
     return map_combined, map_st_upsampled, map_ae_upsampled, map_fusion
 
