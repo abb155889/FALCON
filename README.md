@@ -69,12 +69,12 @@ and ViSA.
 ### 2. Validation Set이 존재하는 비교 방법 설정
 Validation set을 사용하는 비교 방법의 경우, FALCON과의 공정한 비교를 위해 다음과 같이 설정합니다.
 
-- EfficientAD
+- 필수인 경우 (e.g. EfficientAD)
   - 아래 방법 중 하나를 적용합니다.
     - Train set의 일부를 validation set으로 분할
     - Train set 크기의 10–20%에 해당하는 추가 데이터를 validation set으로 사용
 
-- FewSOME
+- 옵션인 경우 (e.g. FewSOME)
   - Test set을 이용한 early stopping 옵션을 비활성화 합니다.
 
 ### 3. Backbone 구조 통일
