@@ -1,6 +1,8 @@
 # FALCON
 
 FALCON: Few-shot Anomaly detection via seLective knowledge distillation and Consecutive mOdule compositioN
+[FALCON__Few_shot_Anomaly_detection_via_seLective_knowledge_distillation_and_Consecutive_mOdule_compositioN__(manuscript).pdf](https://github.com/user-attachments/files/24159886/FALCON__Few_shot_Anomaly_detection_via_seLective_knowledge_distillation_and_Consecutive_mOdule_compositioN__.manuscript.pdf)
+[FALCON__Few_shot_Anomaly_detection_via_seLective_knowledge_distillation_and_Consecutive_mOdule_compositioN_(supplemental).pdf](https://github.com/user-attachments/files/24159891/FALCON__Few_shot_Anomaly_detection_via_seLective_knowledge_distillation_and_Consecutive_mOdule_compositioN_.supplemental.pdf)
 
 
 Few-shot Anomaly Detection (FSAD) aims to detect diverse
