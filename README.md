@@ -62,7 +62,7 @@ and ViSA.
 # 비교군 실험 시 유의사항
 공정하고 일관된 비교 실험을 위해 아래 설정을 동일하게 적용합니다.
 
-## 1. Validation Set 사용 여부
+### 1. Validation Set 사용 여부
 - FALCON은 validation set을 사용하지 않습니다.
 - 학습에는 train image만 사용합니다.
 
