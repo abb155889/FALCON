@@ -57,28 +57,4 @@ and ViSA.
 <p align="center">
   <img src="https://github.com/user-attachments/assets/1af51688-883e-4464-99d0-c648a341f73b" width="49%" />
   <img src="https://github.com/user-attachments/assets/9f75096a-81c4-472b-b9e6-31bc9ecc3a6e" width="49%" />
-</p>
-
-# 비교군 실험 시 유의사항
-공정한 실험을 위해 아래 설정을 동일하게 적용합니다.
-
-### 1. Validation Set 사용 여부
-- FALCON은 validation set을 사용하지 않습니다.
-- 학습에는 train image만 사용합니다.
-
-### 2. Validation Set이 존재하는 비교 방법 설정
-Validation set을 사용하는 비교 방법의 경우, FALCON과의 공정한 비교를 위해 다음과 같이 설정합니다.
-
-- 필수인 경우 (e.g. EfficientAD)
-  - 아래 방법 중 하나를 적용합니다.
-    - Train set의 일부를 validation set으로 분할
-    - Train set 크기의 10–20%에 해당하는 추가 데이터를 validation set으로 사용
-
-- 옵션인 경우 (e.g. FewSOME)
-  - Test set을 이용한 early stopping 옵션을 비활성화 합니다.
-
-### 3. Backbone 구조 통일
-- 모든 방법은 ResNet-18을 backbone으로 사용합니다.
-- 자체 backbone 구조를 사용하는 EfficientAD의 경우:
-  - ResNet-18의 1, 2, 3, 4번 layer를 사용하여 4-layer 구조와 대응시킵니다.
-    
+</p>    
